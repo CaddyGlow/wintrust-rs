@@ -61,3 +61,5 @@ Extracted from `CaddyGlow/windows-uup` at commit
 `63e832067678635809405a9fd8c7820db0904f4e`, including the working-tree
 portable verifier changes present during extraction. The MIT copyright
 notice is preserved in [LICENSE](LICENSE).
+
+Catalog parser fuzzing is maintained in [fuzz](fuzz/README.md).

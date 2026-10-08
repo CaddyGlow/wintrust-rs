@@ -1,2 +1,4 @@
 /target/
 /.direnv/
+/fuzz/target/
+/fuzz/corpus/

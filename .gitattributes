@@ -1,2 +1,3 @@
 # Preserve exact signed fixture bytes on every platform.
 tests/fixtures/** -text
+fuzz/fixtures/** -text
