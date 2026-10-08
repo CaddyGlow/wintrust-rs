@@ -1,5 +1,5 @@
 use crate::portable::{
-    PortableTrustReport, PortableVerifier,
+    PortableTrustReport, Verifier,
     sip::{self, DigestAlgorithm, MemberHashPolicy, SipKind},
 };
 use anyhow::{Context, Result, ensure};
@@ -67,8 +67,7 @@ pub fn crypt_cat_admin_calc_hash_from_file_handle2(
             bytes.len() <= context.policy.max_member_bytes,
             "member byte limit exceeded"
         );
-        let digest = sip::member_hash(&bytes, context.kind, context.algorithm, &context.policy)?;
-        hex::decode(digest).context("decode member digest")
+        sip::member_hash_bytes(&bytes, context.kind, context.algorithm, &context.policy)
     })();
     file.seek(SeekFrom::Start(position))
         .context("restore member file position")?;
@@ -82,7 +81,7 @@ pub fn crypt_cat_admin_release_context(_context: CatalogAdminContext) {}
 /// Requires every configured signature, chain, timestamp and revocation check;
 /// rejected trust is an error rather than an HRESULT or partially trusted report.
 pub fn win_verify_trust(
-    verifier: &PortableVerifier,
+    verifier: &Verifier,
     catalog: &Path,
     member: &Path,
     kind: SipKind,

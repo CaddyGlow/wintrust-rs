@@ -1,5 +1,14 @@
 //! Signed, explicitly supplied offline CRL/OCSP evidence. Missing evidence is unknown.
 use super::crypto;
+#[cfg(feature = "online")]
+use alloc::vec;
+use alloc::{
+    borrow::ToOwned,
+    collections::BTreeSet,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 use anyhow::{Context, Result, ensure};
 use der::{Decode, Encode};
 use serde::{Deserialize, Serialize};
@@ -70,7 +79,11 @@ fn verify_signature(
     allow_sha1: bool,
 ) -> Result<()> {
     crypto::verify_algorithm(
-        &cert.tbs_certificate.subject_public_key_info.to_der()?,
+        &cert
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .map_err(anyhow::Error::msg)?,
         algorithm_der,
         None,
         message,
@@ -94,7 +107,7 @@ fn extensions_supported(
     exts: Option<&[x509_cert::ext::Extension]>,
     allowed: &[&str],
 ) -> Result<()> {
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for e in exts.unwrap_or_default() {
         let oid = e.extn_id.to_string();
         ensure!(seen.insert(oid.clone()), "duplicate revocation extension");
@@ -121,7 +134,7 @@ pub fn verify_crl(
     let outcome = crl::evaluate(
         &[bytes],
         certificate,
-        std::slice::from_ref(issuer),
+        core::slice::from_ref(issuer),
         &[],
         now,
         limits,
@@ -165,7 +178,7 @@ pub fn verify_ocsp(
     limits: RevocationLimits,
 ) -> Result<RevocationStatus> {
     ensure!(bytes.len() <= limits.max_artifact_bytes, "OCSP byte limit");
-    let response = OcspResponse::from_der(bytes)?;
+    let response = OcspResponse::from_der(bytes).map_err(anyhow::Error::msg)?;
     ensure!(
         response.response_status == OcspResponseStatus::Successful,
         "OCSP unsuccessful response"
@@ -177,7 +190,8 @@ pub fn verify_ocsp(
         response.response_type.to_string() == "1.3.6.1.5.5.7.48.1.1",
         "unsupported OCSP response type"
     );
-    let basic = BasicOcspResponse::from_der(response.response.as_bytes())?;
+    let basic =
+        BasicOcspResponse::from_der(response.response.as_bytes()).map_err(anyhow::Error::msg)?;
     let tbs = &basic.tbs_response_data;
     ensure!(
         certificate.tbs_certificate.issuer == issuer.tbs_certificate.subject,
@@ -191,7 +205,7 @@ pub fn verify_ocsp(
     let produced = tbs.produced_at.0.to_unix_duration().as_secs();
     ensure!(produced <= now, "future OCSP producedAt");
     let responder = if responder_matches(&tbs.responder_id, issuer)? {
-        issuer.clone()
+        issuer
     } else {
         let certs = basic
             .certs
@@ -201,13 +215,14 @@ pub fn verify_ocsp(
             certs.len() <= limits.max_chain_certificates,
             "OCSP certificate limit"
         );
-        let candidates = certs
-            .iter()
-            .map(|c| responder_matches(&tbs.responder_id, c).map(|yes| (c, yes)))
-            .collect::<Result<Vec<_>>>()?;
-        let candidates: Vec<_> = candidates.into_iter().filter(|(_, yes)| *yes).collect();
-        ensure!(candidates.len() == 1, "ambiguous OCSP responder");
-        let cert = candidates[0].0;
+        let mut candidate = None;
+        for cert in certs {
+            if responder_matches(&tbs.responder_id, cert)? {
+                ensure!(candidate.is_none(), "ambiguous OCSP responder");
+                candidate = Some(cert);
+            }
+        }
+        let cert = candidate.context("ambiguous OCSP responder")?;
         extensions_supported(
             cert.tbs_certificate.extensions.as_deref(),
             &[
@@ -220,7 +235,8 @@ pub fn verify_ocsp(
         )?;
         if let Some((_, constraints)) = cert
             .tbs_certificate
-            .get::<x509_cert::ext::pkix::BasicConstraints>()?
+            .get::<x509_cert::ext::pkix::BasicConstraints>()
+            .map_err(anyhow::Error::msg)?
         {
             ensure!(!constraints.ca, "OCSP delegate must be an end entity");
         }
@@ -235,8 +251,11 @@ pub fn verify_ocsp(
         );
         verify_signature(
             issuer,
-            &cert.signature_algorithm.to_der()?,
-            &cert.tbs_certificate.to_der()?,
+            &cert
+                .signature_algorithm
+                .to_der()
+                .map_err(anyhow::Error::msg)?,
+            &cert.tbs_certificate.to_der().map_err(anyhow::Error::msg)?,
             cert.signature
                 .as_bytes()
                 .context("unaligned responder signature")?,
@@ -244,7 +263,8 @@ pub fn verify_ocsp(
         )?;
         let eku = cert
             .tbs_certificate
-            .get::<ExtendedKeyUsage>()?
+            .get::<ExtendedKeyUsage>()
+            .map_err(anyhow::Error::msg)?
             .context("OCSP responder EKU absent")?;
         ensure!(
             eku.1.0.iter().any(|o| o.to_string() == "1.3.6.1.5.5.7.3.9"),
@@ -252,7 +272,8 @@ pub fn verify_ocsp(
         );
         let usage = cert
             .tbs_certificate
-            .get::<KeyUsage>()?
+            .get::<KeyUsage>()
+            .map_err(anyhow::Error::msg)?
             .context("OCSP responder keyUsage absent")?;
         ensure!(
             usage.1.digital_signature(),
@@ -287,19 +308,23 @@ pub fn verify_ocsp(
                     && der::asn1::Null::from_der(e.extn_value.as_bytes()).is_ok()),
             "delegated OCSP responder requires signed nocheck"
         );
-        cert.clone()
+        cert
     };
     verify_signature(
-        &responder,
-        &basic.signature_algorithm.to_der()?,
-        &tbs.to_der()?,
+        responder,
+        &basic
+            .signature_algorithm
+            .to_der()
+            .map_err(anyhow::Error::msg)?,
+        &tbs.to_der().map_err(anyhow::Error::msg)?,
         basic
             .signature
             .as_bytes()
             .context("unaligned OCSP signature")?,
         limits.allow_sha1,
     )?;
-    let mut matches = Vec::new();
+    let mut matched_status = None;
+    let mut matching_responses = 0usize;
     for single in &tbs.responses {
         let id = &single.cert_id;
         let oid = id.hash_algorithm.oid.to_string();
@@ -313,7 +338,15 @@ pub fn verify_ocsp(
             continue;
         }
         if id.issuer_name_hash.as_bytes()
-            != crypto::digest_with_policy(&oid, &issuer.tbs_certificate.subject.to_der()?, true)?
+            != crypto::digest_with_policy(
+                &oid,
+                &issuer
+                    .tbs_certificate
+                    .subject
+                    .to_der()
+                    .map_err(anyhow::Error::msg)?,
+                true,
+            )?
             || id.issuer_key_hash.as_bytes()
                 != crypto::digest_with_policy(
                     &oid,
@@ -350,16 +383,17 @@ pub fn verify_ocsp(
             single.this_update.0.to_unix_duration().as_secs() <= produced,
             "OCSP producedAt precedes thisUpdate"
         );
-        matches.push(match single.cert_status {
+        matching_responses += 1;
+        matched_status = Some(match single.cert_status {
             CertStatus::Good(_) => RevocationStatus::Good,
             _ => RevocationStatus::Unknown,
         });
     }
     ensure!(
-        matches.len() == 1,
+        matching_responses == 1,
         "OCSP absent or ambiguous certificate status"
     );
-    Ok(matches[0])
+    matched_status.context("OCSP absent or ambiguous certificate status")
 }
 
 /// Check each non-anchor certificate. Invalid artifacts are diagnostics, never
@@ -389,6 +423,29 @@ pub fn verify_chain_revocation_with_signers(
     now: u64,
     limits: RevocationLimits,
 ) -> Result<RevocationReport> {
+    let crl_refs = crls.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let ocsp_refs = ocsp.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    verify_chain_revocation_with_borrowed_artifacts(
+        path_der,
+        &crl_refs,
+        &ocsp_refs,
+        crl_signers,
+        verification_time,
+        now,
+        limits,
+    )
+}
+
+/// Verify borrowed pinned and acquired artifacts without copying their contents.
+pub(crate) fn verify_chain_revocation_with_borrowed_artifacts(
+    path_der: &[Vec<u8>],
+    crls: &[&[u8]],
+    ocsp: &[&[u8]],
+    crl_signers: &[Vec<u8>],
+    verification_time: u64,
+    now: u64,
+    limits: RevocationLimits,
+) -> Result<RevocationReport> {
     ensure!(
         !path_der.is_empty() && path_der.len() <= limits.max_chain_certificates,
         "revocation chain length limit"
@@ -404,12 +461,13 @@ pub fn verify_chain_revocation_with_signers(
     let path = path_der
         .iter()
         .map(|b| Certificate::from_der(b))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<core::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::msg)?;
     let signers = crl_signers
         .iter()
         .map(|b| Certificate::from_der(b))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let crl_refs = crls.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        .collect::<core::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::msg)?;
     let mut certificates = Vec::new();
     for i in 0..path.len() - 1 {
         let mut report = CertificateStatus {
@@ -419,10 +477,9 @@ pub fn verify_chain_revocation_with_signers(
             diagnostics: Vec::new(),
         };
         if !crls.is_empty() {
-            let outcome =
-                crl::evaluate(&crl_refs, &path[i], &path[i + 1..], &signers, now, limits)?;
+            let outcome = crl::evaluate(crls, &path[i], &path[i + 1..], &signers, now, limits)?;
             for index in &outcome.used {
-                report.evidence_sha256.push(hash(&crls[*index])?);
+                report.evidence_sha256.push(hash(crls[*index])?);
             }
             report
                 .diagnostics
@@ -511,9 +568,35 @@ pub struct ArtifactProvenance {
 
 /// Provenance for policy-pinned evidence. Each artifact's digest was checked
 /// against its pin when the policy was loaded.
+#[cfg(feature = "std")]
 pub fn pinned_provenance(
     crls: &[(&std::path::Path, &[u8])],
     ocsp: &[(&std::path::Path, &[u8])],
+) -> Result<Vec<ArtifactProvenance>> {
+    let crl_locations = crls
+        .iter()
+        .map(|(path, bytes)| (path.display().to_string(), *bytes))
+        .collect::<Vec<_>>();
+    let ocsp_locations = ocsp
+        .iter()
+        .map(|(path, bytes)| (path.display().to_string(), *bytes))
+        .collect::<Vec<_>>();
+    pinned_provenance_labels(
+        &crl_locations
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), *bytes))
+            .collect::<Vec<_>>(),
+        &ocsp_locations
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), *bytes))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Provenance for pinned bytes using caller-supplied locations, without filesystem access.
+pub fn pinned_provenance_labels(
+    crls: &[(&str, &[u8])],
+    ocsp: &[(&str, &[u8])],
 ) -> Result<Vec<ArtifactProvenance>> {
     let mut out = Vec::new();
     for (path, bytes) in crls {
@@ -523,7 +606,7 @@ pub fn pinned_provenance(
         out.push(ArtifactProvenance {
             kind: if delta { "delta-crl" } else { "crl" },
             origin: "pinned-file",
-            location: path.display().to_string(),
+            location: (*path).to_owned(),
             sha256: hash(bytes)?,
             bytes: bytes.len(),
             retrieved_at: None,
@@ -535,7 +618,7 @@ pub fn pinned_provenance(
         out.push(ArtifactProvenance {
             kind: "ocsp",
             origin: "pinned-file",
-            location: path.display().to_string(),
+            location: (*path).to_owned(),
             sha256: hash(bytes)?,
             bytes: bytes.len(),
             retrieved_at: None,
@@ -619,11 +702,11 @@ pub fn acquire_chain_revocation_with_signers(
     let path = path_der
         .iter()
         .map(|b| Certificate::from_der(b))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<core::result::Result<Vec<_>, _>>()?;
     let signers = crl_signers
         .iter()
         .map(|b| Certificate::from_der(b))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<core::result::Result<Vec<_>, _>>()?;
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -633,7 +716,7 @@ pub fn acquire_chain_revocation_with_signers(
     let mut output = AcquiredRevocation::default();
     let mut count = 0usize;
     let mut total = 0usize;
-    let mut attempted = std::collections::BTreeSet::new();
+    let mut attempted = BTreeSet::new();
     for (position, pair) in path.windows(2).enumerate() {
         let cert = &pair[0];
         let issuer = &pair[1];

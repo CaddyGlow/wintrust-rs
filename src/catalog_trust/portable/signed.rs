@@ -1,7 +1,8 @@
 //! PKCS#7/CMS signature verification with exact signed-content binding.
 use super::crypto;
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use anyhow::{Context, Result, bail, ensure};
-use der::{Decode, Encode, Reader, SliceReader, asn1::AnyRef};
+use der::{Decode, Encode, asn1::AnyRef};
 use x509_cert::Certificate;
 
 /// Select embedded content or explicitly supply detached content.
@@ -19,59 +20,26 @@ pub struct VerifiedSigner {
     pub signed_attributes: Vec<(String, Vec<Vec<u8>>)>,
     pub unsigned_attributes: Vec<(String, Vec<Vec<u8>>)>,
 }
+/// Verified content borrows its exact bytes from the CMS or detached input.
+/// Signer and certificate reports remain owned.
 #[derive(Debug)]
-pub struct VerifiedSignedData {
-    pub content_der: Vec<u8>,
-    pub content_value: Vec<u8>,
+pub struct VerifiedSignedData<'a> {
+    pub content_der: &'a [u8],
+    pub content_value: &'a [u8],
     pub signers: Vec<VerifiedSigner>,
     pub certificates: Vec<Vec<u8>>,
     /// Attribute/other certificate choices are retained but never used as signing keys or anchors.
     pub ignored_certificate_choices: Vec<Vec<u8>>,
 }
-#[derive(Clone, Copy)]
-struct Node<'a> {
-    tag: u8,
-    full: &'a [u8],
-    value: &'a [u8],
-}
-fn node(bytes: &[u8]) -> Result<(Node<'_>, usize)> {
-    let mut r = SliceReader::new(bytes)?;
-    let a = AnyRef::decode(&mut r)?;
-    let len = usize::try_from(r.position())?;
-    Ok((
-        Node {
-            tag: bytes[0],
-            full: &bytes[..len],
-            value: a.value(),
-        },
-        len,
-    ))
-}
+use crate::der::{Node, node, oid};
 fn all(bytes: &[u8]) -> Result<Vec<Node<'_>>> {
-    let mut rest = bytes;
-    let mut out = Vec::new();
-    while !rest.is_empty() {
-        ensure!(out.len() < 100_000, "ASN.1 collection limit");
-        let (n, size) = node(rest)?;
-        out.push(n);
-        rest = &rest[size..];
-    }
-    Ok(out)
+    Ok(crate::der::all(bytes, 100_000)?)
 }
 fn fields(n: Node<'_>, tag: u8) -> Result<Vec<Node<'_>>> {
-    ensure!(n.tag == tag, "unexpected ASN.1 tag");
-    all(n.value)
+    all(crate::der::tagged(n, tag)?.value)
 }
 fn at<'a>(f: &[Node<'a>], i: usize, tag: u8) -> Result<Node<'a>> {
-    let n = *f.get(i).context("missing field")?;
-    ensure!(n.tag == tag, "unexpected field tag");
-    Ok(n)
-}
-fn oid(n: Node<'_>) -> Result<String> {
-    ensure!(n.tag == 6, "missing OID");
-    Ok(AnyRef::from_der(n.full)?
-        .decode_as::<der::asn1::ObjectIdentifier>()?
-        .to_string())
+    Ok(crate::der::field(f, i, tag)?)
 }
 fn alg(n: Node<'_>) -> Result<String> {
     let f = fields(n, 0x30)?;
@@ -82,7 +50,7 @@ fn alg(n: Node<'_>) -> Result<String> {
             "unsupported algorithm parameters"
         );
     }
-    oid(f[0])
+    Ok(oid(f[0])?)
 }
 fn attributes(n: Node<'_>) -> Result<Vec<(String, Vec<Vec<u8>>)>> {
     let list = all(n.value)?;
@@ -90,7 +58,7 @@ fn attributes(n: Node<'_>) -> Result<Vec<(String, Vec<Vec<u8>>)>> {
         list.windows(2).all(|p| p[0].full < p[1].full),
         "signed attributes not canonical DER SET"
     );
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = alloc::collections::BTreeSet::new();
     list.into_iter()
         .map(|a| {
             let f = fields(a, 0x30)?;
@@ -120,42 +88,58 @@ fn signer(
     n: Node<'_>,
     content: &[u8],
     content_type: Option<&str>,
-    certificates: &[Vec<u8>],
+    certificates: &[(&[u8], Certificate)],
     allow_sha1: bool,
 ) -> Result<VerifiedSigner> {
     ensure!(
-        certificates.len() <= 64 && certificates.iter().all(|c| c.len() <= 256 * 1024),
+        certificates.len() <= 64 && certificates.iter().all(|(c, _)| c.len() <= 256 * 1024),
         "signer certificate limits"
     );
     let f = fields(n, 0x30)?;
-    let version = AnyRef::from_der(at(&f, 0, 2)?.full)?.decode_as::<u8>()?;
+    let version = AnyRef::from_der(at(&f, 0, 2)?.full)
+        .map_err(anyhow::Error::msg)?
+        .decode_as::<u8>()
+        .map_err(anyhow::Error::msg)?;
     let sid = *f.get(1).context("missing signer id")?;
     ensure!(
         (sid.tag == 0x30 && version == 1) || (sid.tag == 0x80 && version == 3),
         "signer identifier/version mismatch"
     );
-    let mut candidates = Vec::new();
-    for bytes in certificates {
-        let c = Certificate::from_der(bytes)?;
-        let matches = if sid.tag == 0x30 {
-            let ids = fields(sid, 0x30)?;
-            ensure!(ids.len() == 2, "invalid issuer serial");
-            c.tbs_certificate.issuer.to_der()? == ids[0].full
-                && c.tbs_certificate.serial_number.to_der()? == ids[1].full
+    let issuer_serial = if sid.tag == 0x30 {
+        let ids = fields(sid, 0x30)?;
+        ensure!(ids.len() == 2, "invalid issuer serial");
+        Some((ids[0].full, ids[1].full))
+    } else {
+        None
+    };
+    let mut candidate = None;
+    for (bytes, c) in certificates {
+        let matches = if let Some((issuer, serial)) = issuer_serial {
+            c.tbs_certificate
+                .issuer
+                .to_der()
+                .map_err(anyhow::Error::msg)?
+                == issuer
+                && c.tbs_certificate
+                    .serial_number
+                    .to_der()
+                    .map_err(anyhow::Error::msg)?
+                    == serial
         } else {
             c.tbs_certificate
-                .get::<x509_cert::ext::pkix::SubjectKeyIdentifier>()?
+                .get::<x509_cert::ext::pkix::SubjectKeyIdentifier>()
+                .map_err(anyhow::Error::msg)?
                 .is_some_and(|(_, ski)| ski.0.as_bytes() == sid.value)
         };
         if matches {
-            candidates.push((bytes, c));
+            ensure!(
+                candidate.is_none(),
+                "signer certificate missing or ambiguous"
+            );
+            candidate = Some((bytes, c));
         }
     }
-    ensure!(
-        candidates.len() == 1,
-        "signer certificate missing or ambiguous"
-    );
-    let (certificate, cert) = &candidates[0];
+    let (certificate, cert) = candidate.context("signer certificate missing or ambiguous")?;
     let digest_oid = alg(at(&f, 2, 0x30)?)?;
     let mut pos = 3;
     let attrs_node = f.get(pos).copied().filter(|n| n.tag == 0xa0);
@@ -211,12 +195,16 @@ fn signer(
     let signed_bytes = if let Some(attrs) = attrs_node {
         let mut bytes = attrs.full.to_vec();
         bytes[0] = 0x31;
-        bytes
+        Cow::Owned(bytes)
     } else {
-        content.to_vec()
+        Cow::Borrowed(content)
     };
     crypto::verify_algorithm(
-        &cert.tbs_certificate.subject_public_key_info.to_der()?,
+        &cert
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .map_err(anyhow::Error::msg)?,
         signature_algorithm.full,
         Some(&digest_oid),
         &signed_bytes,
@@ -231,14 +219,17 @@ fn signer(
     })
 }
 /// Verify cryptographic signatures and signed content binding; no chain or revocation trust.
-pub fn verify_signed_data(bytes: &[u8], expected_content_oid: &str) -> Result<VerifiedSignedData> {
+pub fn verify_signed_data<'a>(
+    bytes: &'a [u8],
+    expected_content_oid: &str,
+) -> Result<VerifiedSignedData<'a>> {
     verify_signed_data_with_policy(bytes, expected_content_oid, false)
 }
-pub fn verify_signed_data_with_policy(
-    bytes: &[u8],
+pub fn verify_signed_data_with_policy<'a>(
+    bytes: &'a [u8],
     expected_content_oid: &str,
     allow_sha1: bool,
-) -> Result<VerifiedSignedData> {
+) -> Result<VerifiedSignedData<'a>> {
     verify_cms_signed_data(
         bytes,
         expected_content_oid,
@@ -250,12 +241,12 @@ pub fn verify_signed_data_with_policy(
 /// Verify every CMS signer and exact content binding without assigning certificate trust.
 /// Resource limits are 32 MiB for each input, 64 certificates and 16 signers.
 /// Legacy PKCS#7 structured content retains its original content-value hashing.
-pub fn verify_cms_signed_data(
-    bytes: &[u8],
+pub fn verify_cms_signed_data<'a>(
+    bytes: &'a [u8],
     expected_content_oid: &str,
-    content: SignedDataContent<'_>,
+    content: SignedDataContent<'a>,
     allow_sha1: bool,
-) -> Result<VerifiedSignedData> {
+) -> Result<VerifiedSignedData<'a>> {
     preflight(bytes)?;
     ensure!(bytes.len() <= 32 * 1024 * 1024, "SignedData byte limit");
     let (root, len) = node(bytes)?;
@@ -268,7 +259,10 @@ pub fn verify_cms_signed_data(
     let wrap = fields(outer[1], 0xa0)?;
     ensure!(wrap.len() == 1, "invalid SignedData wrapper");
     let sd = fields(wrap[0], 0x30)?;
-    let version = AnyRef::from_der(at(&sd, 0, 2)?.full)?.decode_as::<u8>()?;
+    let version = AnyRef::from_der(at(&sd, 0, 2)?.full)
+        .map_err(anyhow::Error::msg)?
+        .decode_as::<u8>()
+        .map_err(anyhow::Error::msg)?;
     ensure!((1..=5).contains(&version), "unsupported SignedData version");
     let algorithms = fields(at(&sd, 1, 0x31)?, 0x31)?
         .into_iter()
@@ -289,7 +283,7 @@ pub fn verify_cms_signed_data(
                 bytes.len() <= 32 * 1024 * 1024,
                 "detached content byte limit"
             );
-            (bytes.to_vec(), bytes.to_vec())
+            (bytes, bytes)
         }
         SignedDataContent::Embedded => {
             ensure!(
@@ -299,9 +293,9 @@ pub fn verify_cms_signed_data(
             let encap = fields(info[1], 0xa0)?;
             ensure!(encap.len() == 1, "invalid content wrapper");
             if encap[0].tag == 4 {
-                (encap[0].value.to_vec(), encap[0].value.to_vec())
+                (encap[0].value, encap[0].value)
             } else {
-                (encap[0].full.to_vec(), encap[0].value.to_vec())
+                (encap[0].full, encap[0].value)
             }
         }
     };
@@ -336,19 +330,21 @@ pub fn verify_cms_signed_data(
                             && choice_fields[2].tag == 3,
                         "malformed attribute/extended certificate choice"
                     );
-                    AnyRef::from_der(choice_fields[2].full)?
-                        .decode_as::<der::asn1::BitStringRef>()?;
+                    AnyRef::from_der(choice_fields[2].full)
+                        .map_err(anyhow::Error::msg)?
+                        .decode_as::<der::asn1::BitStringRef>()
+                        .map_err(anyhow::Error::msg)?;
                 }
                 ignored_certificate_choices.push(c.full.to_vec());
                 continue;
             }
             ensure!(c.tag == 0x30, "unsupported certificate choice");
-            Certificate::from_der(c.full)?;
+            let parsed = Certificate::from_der(c.full).map_err(anyhow::Error::msg)?;
             if !certificates
                 .iter()
-                .any(|b: &Vec<u8>| b.as_slice() == c.full)
+                .any(|(b, _): &(&[u8], Certificate)| *b == c.full)
             {
-                certificates.push(c.full.to_vec());
+                certificates.push((c.full, parsed));
             }
         }
         pos += 1;
@@ -371,7 +367,7 @@ pub fn verify_cms_signed_data(
         );
         signers.push(signer(
             raw,
-            &content_value,
+            content_value,
             Some(expected_content_oid),
             &certificates,
             allow_sha1,
@@ -381,7 +377,10 @@ pub fn verify_cms_signed_data(
         content_der,
         content_value,
         signers,
-        certificates,
+        certificates: certificates
+            .into_iter()
+            .map(|(bytes, _)| bytes.to_vec())
+            .collect(),
         ignored_certificate_choices,
     })
 }
@@ -409,37 +408,26 @@ pub fn verify_counter_signer_with_policy(
         len == signer_info_der.len(),
         "trailing counter-signer bytes"
     );
-    signer(n, original_signature, None, certificates, allow_sha1)
+    ensure!(
+        certificates.len() <= 64 && certificates.iter().all(|c| c.len() <= 256 * 1024),
+        "signer certificate limits"
+    );
+    let certificates = certificates
+        .iter()
+        .map(|bytes| {
+            Ok((
+                bytes.as_slice(),
+                Certificate::from_der(bytes).map_err(anyhow::Error::msg)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    signer(n, original_signature, None, &certificates, allow_sha1)
 }
 
 fn preflight(bytes: &[u8]) -> Result<()> {
     ensure!(bytes.len() <= 32 * 1024 * 1024, "ASN.1 byte limit");
     let (root, len) = node(bytes)?;
     ensure!(len == bytes.len(), "trailing ASN.1 bytes");
-    let mut stack = vec![(root, 0usize)];
-    let mut nodes = 0usize;
-    while let Some((n, depth)) = stack.pop() {
-        nodes += 1;
-        ensure!(
-            nodes <= 500_000 && stack.len() <= 500_000,
-            "ASN.1 node limit"
-        );
-        ensure!(depth <= 64, "ASN.1 depth limit");
-        if n.tag & 0x20 != 0 {
-            let mut rest = n.value;
-            let mut previous: Option<&[u8]> = None;
-            while !rest.is_empty() {
-                let (child, size) = node(rest)?;
-                ensure!(
-                    n.tag != 0x31 || previous.is_none_or(|p| p <= child.full),
-                    "noncanonical DER SET order"
-                );
-                previous = Some(child.full);
-                stack.push((child, depth + 1));
-                rest = &rest[size..];
-                ensure!(stack.len() <= 500_000, "ASN.1 node limit");
-            }
-        }
-    }
+    crate::der::preflight(root, crate::catalog::CatalogLimits::default(), &mut 0)?;
     Ok(())
 }

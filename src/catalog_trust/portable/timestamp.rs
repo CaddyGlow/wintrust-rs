@@ -1,7 +1,14 @@
 //! Authenticated timestamp binding. A signed signingTime alone is not a timestamp.
 use super::{chain, crypto, signed};
+use alloc::{
+    borrow::ToOwned,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use anyhow::{Context, Result, bail, ensure};
-use der::{Decode, Reader, SliceReader, asn1::AnyRef};
+use der::{Decode, asn1::AnyRef};
 use serde::Serialize;
 use x509_cert::Certificate;
 
@@ -28,63 +35,39 @@ pub struct TimestampReport {
     #[serde(skip)]
     pub chain_der: Vec<Vec<u8>>,
 }
-#[derive(Clone, Copy)]
-struct Node<'a> {
-    tag: u8,
-    full: &'a [u8],
-    value: &'a [u8],
-}
-fn node(bytes: &[u8]) -> Result<(Node<'_>, usize)> {
-    ensure!(!bytes.is_empty(), "missing DER value");
-    let mut r = SliceReader::new(bytes)?;
-    let a = AnyRef::decode(&mut r)?;
-    let size = usize::try_from(r.position())?;
-    Ok((
-        Node {
-            tag: bytes[0],
-            full: &bytes[..size],
-            value: a.value(),
-        },
-        size,
-    ))
-}
+use crate::der::{Node, node, oid};
+
 fn fields(n: Node<'_>) -> Result<Vec<Node<'_>>> {
-    let mut rest = n.value;
-    let mut output = Vec::new();
-    while !rest.is_empty() {
-        ensure!(output.len() < 128, "timestamp field limit");
-        let (n, size) = node(rest)?;
-        output.push(n);
-        rest = &rest[size..];
-    }
-    Ok(output)
-}
-fn oid(n: Node<'_>) -> Result<String> {
-    ensure!(n.tag == 6, "expected OID");
-    Ok(AnyRef::from_der(n.full)?
-        .decode_as::<der::asn1::ObjectIdentifier>()?
-        .to_string())
+    Ok(crate::der::all(n.value, 128)?)
 }
 fn integer(n: Node<'_>) -> Result<u64> {
     ensure!(n.tag == 2, "expected INTEGER");
-    Ok(AnyRef::from_der(n.full)?.decode_as::<u64>()?)
+    AnyRef::from_der(n.full)
+        .map_err(anyhow::Error::msg)?
+        .decode_as::<u64>()
+        .map_err(anyhow::Error::msg)
 }
 fn implicit_integer(n: Node<'_>) -> Result<u64> {
     let mut der = n.full.to_vec();
     der[0] = 2;
-    Ok(AnyRef::from_der(&der)?.decode_as::<u64>()?)
+    AnyRef::from_der(&der)
+        .map_err(anyhow::Error::msg)?
+        .decode_as::<u64>()
+        .map_err(anyhow::Error::msg)
 }
 fn time(n: Node<'_>) -> Result<u64> {
     if n.tag == 0x17 {
-        return Ok(AnyRef::from_der(n.full)?
-            .decode_as::<der::asn1::UtcTime>()?
+        return Ok(AnyRef::from_der(n.full)
+            .map_err(anyhow::Error::msg)?
+            .decode_as::<der::asn1::UtcTime>()
+            .map_err(anyhow::Error::msg)?
             .to_unix_duration()
             .as_secs());
     }
     ensure!(n.tag == 0x18, "expected generalized time");
     // RFC3161 allows fractional seconds. Require DER UTC encoding and validate
     // the calendar with der's DateTime after removing the fractional component.
-    let value = std::str::from_utf8(n.value)?;
+    let value = core::str::from_utf8(n.value)?;
     ensure!(value.ends_with('Z'), "timestamp requires UTC");
     let calendar =
         if let Some((base, fraction)) = value.strip_suffix('Z').and_then(|v| v.split_once('.')) {
@@ -103,13 +86,15 @@ fn time(n: Node<'_>) -> Result<u64> {
     ensure!(calendar.len() == 15, "invalid generalized time");
     let mut encoded = vec![0x18, 15];
     encoded.extend_from_slice(calendar.as_bytes());
-    Ok(AnyRef::from_der(&encoded)?
-        .decode_as::<der::asn1::GeneralizedTime>()?
+    Ok(AnyRef::from_der(&encoded)
+        .map_err(anyhow::Error::msg)?
+        .decode_as::<der::asn1::GeneralizedTime>()
+        .map_err(anyhow::Error::msg)?
         .to_unix_duration()
         .as_secs())
 }
 fn require_tsa(der: &[u8], rfc3161: bool, noncritical_tsa_pins: &[String]) -> Result<bool> {
-    let cert = Certificate::from_der(der)?;
+    let cert = Certificate::from_der(der).map_err(anyhow::Error::msg)?;
     let extensions = cert
         .tbs_certificate
         .extensions
@@ -120,7 +105,8 @@ fn require_tsa(der: &[u8], rfc3161: bool, noncritical_tsa_pins: &[String]) -> Re
         .filter(|e| e.extn_id.to_string() == "2.5.29.37")
         .collect();
     ensure!(eku.len() == 1, "timestamp EKU must be unique");
-    let purposes = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(eku[0].extn_value.as_bytes())?;
+    let purposes = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(eku[0].extn_value.as_bytes())
+        .map_err(anyhow::Error::msg)?;
     ensure!(
         purposes.0.iter().any(|p| p.to_string() == TSA_EKU),
         "timestamp signer must have TSA EKU"
@@ -145,66 +131,58 @@ fn require_tsa(der: &[u8], rfc3161: bool, noncritical_tsa_pins: &[String]) -> Re
     Ok(compatibility_used)
 }
 
-/// Verify RFC3161/Microsoft timestamp CMS, original signature imprint and TSA
-/// chain against explicit roots at the authenticated time. Revocation is a
-/// separate required caller policy; this function never claims non-revocation.
+/// Explicit timestamp trust inputs. Issuer candidates help construct paths;
+/// only the supplied roots can anchor trust. The evaluation clock is required.
+#[derive(Debug, Clone)]
+pub struct TimestampOptions<'a> {
+    pub roots: &'a [Vec<u8>],
+    pub issuer_candidates: &'a [Vec<u8>],
+    pub evaluation_time: u64,
+    pub allow_sha1: bool,
+    pub path_limits: chain::PathLimits,
+    /// Exact Microsoft TSA leaf fingerprints permitting a sole noncritical TSA EKU.
+    pub noncritical_tsa_certificate_sha256: &'a [String],
+}
+
+impl<'a> TimestampOptions<'a> {
+    pub fn new(roots: &'a [Vec<u8>], evaluation_time: u64) -> Self {
+        Self {
+            roots,
+            issuer_candidates: &[],
+            evaluation_time,
+            allow_sha1: false,
+            path_limits: chain::PathLimits::default(),
+            noncritical_tsa_certificate_sha256: &[],
+        }
+    }
+}
+
+/// Authenticate the timestamp imprint, ESS binding and one TSA path covering
+/// the full accuracy interval. Revocation belongs to the caller's path policy.
 pub fn verify_rfc3161(
     token: &[u8],
     original_signature: &[u8],
-    roots: &[Vec<u8>],
-    now: u64,
+    options: &TimestampOptions<'_>,
 ) -> Result<TimestampReport> {
-    ensure!(token.len() <= 4 * 1024 * 1024, "timestamp byte limit");
-    verify_rfc3161_with_policy(token, original_signature, roots, now, false)
-}
-pub fn verify_rfc3161_with_policy(
-    token: &[u8],
-    original_signature: &[u8],
-    roots: &[Vec<u8>],
-    now: u64,
-    allow_sha1: bool,
-) -> Result<TimestampReport> {
-    verify_rfc3161_with_compatibility(token, original_signature, roots, now, allow_sha1, &[])
+    verify_rfc3161_inner(token, original_signature, options, &mut |_, _| Ok(()))
 }
 
-fn verify_rfc3161_with_compatibility(
+fn verify_rfc3161_inner(
     token: &[u8],
     original_signature: &[u8],
-    roots: &[Vec<u8>],
-    now: u64,
-    allow_sha1: bool,
-    noncritical_tsa_pins: &[String],
+    options: &TimestampOptions<'_>,
+    accept_path: &mut TimestampPathPolicy<'_>,
 ) -> Result<TimestampReport> {
-    verify_rfc3161_with_path_policy(
-        token,
-        original_signature,
-        roots,
-        now,
-        allow_sha1,
-        noncritical_tsa_pins,
-        &[],
-        chain::PathLimits::default(),
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn verify_rfc3161_with_path_policy(
-    token: &[u8],
-    original_signature: &[u8],
-    roots: &[Vec<u8>],
-    now: u64,
-    allow_sha1: bool,
-    noncritical_tsa_pins: &[String],
-    issuer_candidates: &[Vec<u8>],
-    limits: chain::PathLimits,
-    accept_path: Option<&mut TimestampPathPolicy<'_>>,
-) -> Result<TimestampReport> {
+    let roots = options.roots;
+    let now = options.evaluation_time;
+    let allow_sha1 = options.allow_sha1;
+    let noncritical_tsa_pins = options.noncritical_tsa_certificate_sha256;
+    let issuer_candidates = options.issuer_candidates;
     ensure!(token.len() <= 4 * 1024 * 1024, "timestamp byte limit");
     let mut cms = signed::verify_signed_data_with_policy(token, TST_INFO, allow_sha1)?;
     cms.certificates.extend_from_slice(issuer_candidates);
     ensure!(cms.signers.len() == 1, "timestamp requires one signer");
-    let (tst, size) = node(&cms.content_value)?;
+    let (tst, size) = node(cms.content_value)?;
     ensure!(
         size == cms.content_value.len() && tst.tag == 0x30,
         "invalid TSTInfo"
@@ -288,10 +266,15 @@ fn verify_rfc3161_with_path_policy(
             names.len() == 1 && names[0].tag == 0xa4,
             "unsupported TSA name form"
         );
-        let cert = Certificate::from_der(&signer.certificate_der)?;
+        let cert = Certificate::from_der(&signer.certificate_der).map_err(anyhow::Error::msg)?;
         use der::Encode;
         ensure!(
-            names[0].value == cert.tbs_certificate.subject.to_der()?,
+            names[0].value
+                == cert
+                    .tbs_certificate
+                    .subject
+                    .to_der()
+                    .map_err(anyhow::Error::msg)?,
             "TSA name does not match signer"
         );
         pos += 1;
@@ -308,55 +291,17 @@ fn verify_rfc3161_with_path_policy(
         .checked_add(bound)
         .context("timestamp accuracy overflow")?;
     ensure!(end <= now, "timestamp uncertainty extends into future");
-    let validate_chain = |at| {
-        if compatibility_used {
-            chain::validate_microsoft_timestamp_with_policy(
-                &signer.certificate_der,
-                &cms.certificates,
-                roots,
-                at,
-                allow_sha1,
-            )
-        } else {
-            chain::validate_with_policy(
-                &signer.certificate_der,
-                &cms.certificates,
-                roots,
-                at,
-                TSA_EKU,
-                allow_sha1,
-            )
-        }
-    };
-    let (start_path, path) = if let Some(accept_path) = accept_path {
-        ensure!(
-            !compatibility_used,
-            "callback timestamp policy requires strict TSA certificates"
-        );
-        let path = chain::validate_with_path_policy(
-            &signer.certificate_der,
-            &cms.certificates,
-            roots,
-            end,
-            TSA_EKU,
-            allow_sha1,
-            limits,
-            |path| {
-                chain::validate_report_constraints(path, start, TSA_EKU)?;
-                accept_path(path, unix_time)
-            },
-        )?;
-        (path.clone(), path)
-    } else {
-        (validate_chain(start)?, validate_chain(end)?)
-    };
-    if compatibility_used {
-        ensure!(
-            super::MICROSOFT_ROOTS.contains(&start_path.anchor_sha256.as_str())
-                && super::MICROSOFT_ROOTS.contains(&path.anchor_sha256.as_str()),
-            "pinned noncritical TSA compatibility requires an authorized Microsoft root"
-        );
-    }
+    let path = chain::validate_timestamp_path(
+        &signer.certificate_der,
+        &cms.certificates,
+        roots,
+        end,
+        start,
+        allow_sha1,
+        compatibility_used,
+        options.path_limits,
+        |path| accept_path(path, unix_time),
+    )?;
     Ok(TimestampReport {
         format: "rfc3161".into(),
         unix_time,
@@ -373,52 +318,29 @@ fn verify_rfc3161_with_path_policy(
     })
 }
 
-/// Legacy Authenticode countersignature: digest/signature authentication comes
-/// from the CMS verifier, and its signed signingTime is validated with TSA trust.
+/// Authenticate a legacy Authenticode countersignature and its signed time.
 pub fn verify_legacy(
     counter: &[u8],
     original_signature: &[u8],
-    certificates: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    now: u64,
+    options: &TimestampOptions<'_>,
+) -> Result<TimestampReport> {
+    verify_legacy_inner(counter, original_signature, options, &mut |_, _| Ok(()))
+}
+
+fn verify_legacy_inner(
+    counter: &[u8],
+    original_signature: &[u8],
+    options: &TimestampOptions<'_>,
+    accept_path: &mut TimestampPathPolicy<'_>,
 ) -> Result<TimestampReport> {
     ensure!(
         counter.len() <= 4 * 1024 * 1024,
         "countersignature byte limit"
     );
-    verify_legacy_with_policy(counter, original_signature, certificates, roots, now, false)
-}
-pub fn verify_legacy_with_policy(
-    counter: &[u8],
-    original_signature: &[u8],
-    certificates: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    now: u64,
-    allow_sha1: bool,
-) -> Result<TimestampReport> {
-    verify_legacy_with_path_policy(
-        counter,
-        original_signature,
-        certificates,
-        roots,
-        now,
-        allow_sha1,
-        chain::PathLimits::default(),
-        &mut |_, _| Ok(()),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn verify_legacy_with_path_policy(
-    counter: &[u8],
-    original_signature: &[u8],
-    certificates: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    now: u64,
-    allow_sha1: bool,
-    limits: chain::PathLimits,
-    accept_path: &mut TimestampPathPolicy<'_>,
-) -> Result<TimestampReport> {
+    let certificates = options.issuer_candidates;
+    let roots = options.roots;
+    let now = options.evaluation_time;
+    let allow_sha1 = options.allow_sha1;
     let signer = signed::verify_counter_signer_with_policy(
         counter,
         original_signature,
@@ -462,7 +384,7 @@ fn verify_legacy_with_path_policy(
         unix_time,
         TSA_EKU,
         allow_sha1,
-        limits,
+        options.path_limits,
         |path| accept_path(path, unix_time),
     )?;
     Ok(TimestampReport {
@@ -481,125 +403,40 @@ fn verify_legacy_with_path_policy(
     })
 }
 
-/// Authenticate every advertised timestamp; reject ambiguity and invalid tokens
-/// instead of treating failed timestamp verification as an absent timestamp.
+/// Authenticate advertised timestamps, rejecting invalid or ambiguous tokens.
 pub fn verify_timestamps(
     signer: &signed::VerifiedSigner,
-    certificates: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    now: u64,
+    options: &TimestampOptions<'_>,
 ) -> Result<Option<TimestampReport>> {
-    verify_timestamps_with_policy(signer, certificates, roots, now, false)
-}
-pub fn verify_timestamps_with_policy(
-    signer: &signed::VerifiedSigner,
-    certificates: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    now: u64,
-    allow_sha1: bool,
-) -> Result<Option<TimestampReport>> {
-    verify_timestamps_with_compatibility(signer, certificates, roots, now, allow_sha1, &[])
+    verify_timestamps_with_path_policy(signer, options, |_, _| Ok(()))
 }
 
-pub(super) fn verify_timestamps_with_compatibility(
-    signer: &signed::VerifiedSigner,
-    certificates: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    now: u64,
-    allow_sha1: bool,
-    noncritical_tsa_pins: &[String],
-) -> Result<Option<TimestampReport>> {
-    verify_timestamps_inner(
-        signer,
-        certificates,
-        roots,
-        now,
-        allow_sha1,
-        noncritical_tsa_pins,
-        chain::PathLimits::default(),
-        None,
-    )
-}
-
-/// Verify timestamp binding and search TSA paths with a caller policy before
-/// selecting a path. The callback receives the authenticated timestamp time.
-#[allow(clippy::too_many_arguments)]
+/// Evaluate caller policy on each fully authenticated TSA path. Rejected paths
+/// continue alternative search under the configured work limits.
 pub fn verify_timestamps_with_path_policy(
     signer: &signed::VerifiedSigner,
-    certificates: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    now: u64,
-    allow_sha1: bool,
-    limits: chain::PathLimits,
+    options: &TimestampOptions<'_>,
     mut accept_path: impl FnMut(&chain::ChainReport, u64) -> Result<()>,
 ) -> Result<Option<TimestampReport>> {
-    verify_timestamps_inner(
-        signer,
-        certificates,
-        roots,
-        now,
-        allow_sha1,
-        &[],
-        limits,
-        Some(&mut accept_path),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn verify_timestamps_inner(
-    signer: &signed::VerifiedSigner,
-    certificates: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    now: u64,
-    allow_sha1: bool,
-    noncritical_tsa_pins: &[String],
-    limits: chain::PathLimits,
-    mut accept_path: Option<&mut TimestampPathPolicy<'_>>,
-) -> Result<Option<TimestampReport>> {
-    let mut timestamps = Vec::new();
+    let mut timestamp = None;
     for (oid, values) in &signer.unsigned_attributes {
-        if oid == RFC3161_ATTRIBUTE || oid == MICROSOFT_RFC3161_ATTRIBUTE {
-            ensure!(values.len() == 1, "ambiguous RFC3161 timestamp values");
-            timestamps.push(verify_rfc3161_with_path_policy(
-                &values[0],
-                &signer.signature,
-                roots,
-                now,
-                allow_sha1,
-                noncritical_tsa_pins,
-                certificates,
-                limits,
-                accept_path
-                    .as_mut()
-                    .map(|callback| &mut **callback as &mut TimestampPathPolicy<'_>),
-            )?);
-        } else if oid == COUNTERSIGNATURE_ATTRIBUTE {
-            ensure!(
-                values.len() == 1,
-                "ambiguous legacy countersignature values"
-            );
-            let mut noop = |_: &chain::ChainReport, _: u64| Ok(());
-            let callback = accept_path
-                .as_mut()
-                .map(|callback| &mut **callback as &mut TimestampPathPolicy<'_>)
-                .unwrap_or(&mut noop);
-            timestamps.push(verify_legacy_with_path_policy(
-                &values[0],
-                &signer.signature,
-                certificates,
-                roots,
-                now,
-                allow_sha1,
-                limits,
-                callback,
-            )?);
+        let rfc3161 = oid == RFC3161_ATTRIBUTE || oid == MICROSOFT_RFC3161_ATTRIBUTE;
+        let legacy = oid == COUNTERSIGNATURE_ATTRIBUTE;
+        if !rfc3161 && !legacy {
+            continue;
         }
+        ensure!(values.len() == 1, "ambiguous timestamp values");
+        ensure!(
+            timestamp.is_none(),
+            "ambiguous timestamps on catalog signer"
+        );
+        timestamp = Some(if rfc3161 {
+            verify_rfc3161_inner(&values[0], &signer.signature, options, &mut accept_path)?
+        } else {
+            verify_legacy_inner(&values[0], &signer.signature, options, &mut accept_path)?
+        });
     }
-    ensure!(
-        timestamps.len() <= 1,
-        "ambiguous timestamps on catalog signer"
-    );
-    Ok(timestamps.pop())
+    Ok(timestamp)
 }
 
 // RFC3161 requires an authenticated ESS certificate identifier. This is an
@@ -664,17 +501,27 @@ fn verify_ess(signer: &signed::VerifiedSigner) -> Result<()> {
             sf.len() == 2 && sf[0].tag == 0x30 && sf[1].tag == 2,
             "invalid ESS issuerSerial"
         );
-        let cert = Certificate::from_der(&signer.certificate_der)?;
+        let cert = Certificate::from_der(&signer.certificate_der).map_err(anyhow::Error::msg)?;
         use der::Encode;
         ensure!(
-            sf[1].full == cert.tbs_certificate.serial_number.to_der()?,
+            sf[1].full
+                == cert
+                    .tbs_certificate
+                    .serial_number
+                    .to_der()
+                    .map_err(anyhow::Error::msg)?,
             "ESS serial mismatch"
         );
         let names = fields(sf[0])?;
         ensure!(
             names.len() == 1
                 && names[0].tag == 0xa4
-                && names[0].value == cert.tbs_certificate.issuer.to_der()?,
+                && names[0].value
+                    == cert
+                        .tbs_certificate
+                        .issuer
+                        .to_der()
+                        .map_err(anyhow::Error::msg)?,
             "ESS issuer mismatch"
         );
         pos += 1;

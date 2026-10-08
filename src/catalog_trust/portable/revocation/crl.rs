@@ -7,9 +7,17 @@
 //! authenticated listing of the certificate is `Revoked` regardless of
 //! freshness. Everything else is `Unknown`.
 use super::{RevocationLimits, RevocationStatus, extensions_supported, fresh, verify_signature};
+use alloc::{
+    borrow::ToOwned,
+    collections::BTreeSet,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use anyhow::{Context, Result, bail, ensure};
+use core::cmp::Ordering;
 use der::{Decode, Encode, asn1::Uint};
-use std::{cmp::Ordering, collections::BTreeSet};
 use x509_cert::{
     Certificate,
     crl::CertificateList,
@@ -42,7 +50,7 @@ pub(super) struct CrlOutcome {
     pub diagnostics: Vec<String>,
 }
 
-struct Parsed {
+struct AuthenticatedCrl {
     list: CertificateList,
     crl_number: Option<Vec<u8>>,
     base_number: Option<Vec<u8>>,
@@ -53,7 +61,7 @@ struct Parsed {
     next_update: Option<u64>,
 }
 
-impl Parsed {
+impl AuthenticatedCrl {
     fn is_delta(&self) -> bool {
         self.base_number.is_some()
     }
@@ -73,7 +81,8 @@ fn compare_numbers(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 fn authority_matches(aki_der: &[u8], signer: &Certificate) -> Result<bool> {
-    let aki = x509_cert::ext::pkix::AuthorityKeyIdentifier::from_der(aki_der)?;
+    let aki = x509_cert::ext::pkix::AuthorityKeyIdentifier::from_der(aki_der)
+        .map_err(anyhow::Error::msg)?;
     ensure!(
         aki.authority_cert_issuer.is_some() == aki.authority_cert_serial_number.is_some(),
         "CRL authority issuer/serial must appear together"
@@ -85,7 +94,11 @@ fn authority_matches(aki_der: &[u8], signer: &Certificate) -> Result<bool> {
         return Ok(false);
     }
     if let Some(key) = aki.key_identifier {
-        let Some((_, ski)) = signer.tbs_certificate.get::<SubjectKeyIdentifier>()? else {
+        let Some((_, ski)) = signer
+            .tbs_certificate
+            .get::<SubjectKeyIdentifier>()
+            .map_err(anyhow::Error::msg)?
+        else {
             return Ok(false);
         };
         if key != ski.0 {
@@ -116,13 +129,13 @@ fn authorize_signer(
     let mut intermediates = Vec::new();
     for certificate in ancestry[..ancestry.len() - 1].iter().chain(pool) {
         if certificate != candidate {
-            intermediates.push(certificate.to_der()?);
+            intermediates.push(certificate.to_der().map_err(anyhow::Error::msg)?);
         }
     }
     chain::validate_with_options(
-        &candidate.to_der()?,
+        &candidate.to_der().map_err(anyhow::Error::msg)?,
         &intermediates,
-        &[anchor.to_der()?],
+        &[anchor.to_der().map_err(anyhow::Error::msg)?],
         now,
         "",
         limits.allow_sha1,
@@ -143,10 +156,10 @@ fn authenticate(
     signers: &[Certificate],
     now: u64,
     limits: RevocationLimits,
-) -> Result<Parsed> {
+) -> Result<AuthenticatedCrl> {
     ensure!(bytes.len() <= limits.max_artifact_bytes, "CRL byte limit");
     let issuer = ancestry.first().context("CRL certificate issuer missing")?;
-    let list = CertificateList::from_der(bytes)?;
+    let list = CertificateList::from_der(bytes).map_err(anyhow::Error::msg)?;
     let tbs = &list.tbs_cert_list;
     ensure!(
         tbs.signature == list.signature_algorithm,
@@ -174,18 +187,19 @@ fn authenticate(
         match id.as_str() {
             OID_CRL_NUMBER => {
                 ensure!(!extension.critical, "critical CRL number");
-                crl_number = Some(number(&Uint::from_der(value)?));
+                crl_number = Some(number(&Uint::from_der(value).map_err(anyhow::Error::msg)?));
             }
             OID_DELTA_INDICATOR => {
                 ensure!(extension.critical, "deltaCRLIndicator must be critical");
-                base_number = Some(number(&Uint::from_der(value)?));
+                base_number = Some(number(&Uint::from_der(value).map_err(anyhow::Error::msg)?));
             }
             OID_ISSUING_DISTRIBUTION_POINT => {
                 ensure!(
                     extension.critical,
                     "issuingDistributionPoint must be critical"
                 );
-                let point = IssuingDistributionPoint::from_der(value)?;
+                let point =
+                    IssuingDistributionPoint::from_der(value).map_err(anyhow::Error::msg)?;
                 ensure!(
                     u8::from(point.only_contains_user_certs)
                         + u8::from(point.only_contains_ca_certs)
@@ -214,17 +228,21 @@ fn authenticate(
         .signature
         .as_bytes()
         .context("unaligned CRL signature")?;
-    let message = tbs.to_der()?;
-    let algorithm = list.signature_algorithm.to_der()?;
+    let message = tbs.to_der().map_err(anyhow::Error::msg)?;
+    let algorithm = list
+        .signature_algorithm
+        .to_der()
+        .map_err(anyhow::Error::msg)?;
     let mut last_error = anyhow::anyhow!("no CRL signing certificate for the CRL issuer");
-    for (position, candidate) in std::iter::once(issuer).chain(signers).enumerate() {
+    for (position, candidate) in core::iter::once(issuer).chain(signers).enumerate() {
         if candidate.tbs_certificate.subject != tbs.issuer {
             continue;
         }
         let attempt = (|| -> Result<()> {
             let usage = candidate
                 .tbs_certificate
-                .get::<KeyUsage>()?
+                .get::<KeyUsage>()
+                .map_err(anyhow::Error::msg)?
                 .context("CRL signer keyUsage missing")?;
             ensure!(usage.1.crl_sign(), "CRL signer lacks cRLSign usage");
             if position > 0 && candidate != issuer {
@@ -248,7 +266,7 @@ fn authenticate(
             Ok(()) => {
                 let this_update = tbs.this_update.to_unix_duration().as_secs();
                 let next_update = tbs.next_update.map(|t| t.to_unix_duration().as_secs());
-                return Ok(Parsed {
+                return Ok(AuthenticatedCrl {
                     list,
                     crl_number,
                     base_number,
@@ -278,7 +296,7 @@ impl Listing {
 
 /// Find the entry for `certificate`, tracking `certificateIssuer` through indirect CRLs.
 fn lookup(
-    crl: &Parsed,
+    crl: &AuthenticatedCrl,
     certificate: &Certificate,
     now: u64,
     limits: RevocationLimits,
@@ -303,7 +321,8 @@ fn lookup(
                 OID_CERTIFICATE_ISSUER => {
                     ensure!(indirect, "certificateIssuer in a CRL that is not indirect");
                     ensure!(extension.critical, "certificateIssuer must be critical");
-                    let names = Vec::<GeneralName>::from_der(extension.extn_value.as_bytes())?;
+                    let names = Vec::<GeneralName>::from_der(extension.extn_value.as_bytes())
+                        .map_err(anyhow::Error::msg)?;
                     match names.as_slice() {
                         [GeneralName::DirectoryName(name)] => current_issuer = name.clone(),
                         _ => bail!("unsupported certificateIssuer form"),
@@ -311,14 +330,15 @@ fn lookup(
                 }
                 OID_CRL_REASON => {
                     ensure!(!extension.critical, "critical CRL reason code");
-                    reason = CrlReason::from_der(extension.extn_value.as_bytes())?;
+                    reason = CrlReason::from_der(extension.extn_value.as_bytes())
+                        .map_err(anyhow::Error::msg)?;
                 }
                 _ => {}
             }
         }
         ensure!(
             seen.insert((
-                current_issuer.to_der()?,
+                current_issuer.to_der().map_err(anyhow::Error::msg)?,
                 entry.serial_number.as_bytes().to_vec()
             )),
             "duplicate CRL serial"
@@ -342,7 +362,7 @@ fn bits(flags: x509_cert::ext::pkix::crl::dp::ReasonFlags) -> u16 {
 
 /// RFC 5280 6.3.3: the CRL issuer must be the certificate issuer, or the
 /// `cRLIssuer` the distribution point names for an indirect CRL.
-fn bound(crl: &Parsed, certificate: &Certificate, point: &DistributionPoint) -> bool {
+fn bound(crl: &AuthenticatedCrl, certificate: &Certificate, point: &DistributionPoint) -> bool {
     let issuer = crl.issuer();
     match &point.crl_issuer {
         Some(names) => {
@@ -372,7 +392,7 @@ fn full_names(name: &DistributionPointName, base: &Name) -> Vec<GeneralName> {
 /// Reasons this CRL covers for `certificate` under distribution point `point`,
 /// or `None` when the CRL's scope excludes the certificate.
 fn scope(
-    crl: &Parsed,
+    crl: &AuthenticatedCrl,
     certificate: &Certificate,
     is_ca: bool,
     point: &DistributionPoint,
@@ -428,7 +448,7 @@ fn scope(
     (mask != 0).then_some(mask)
 }
 
-fn delta_applies(delta: &Parsed, base: &Parsed) -> bool {
+fn delta_applies(delta: &AuthenticatedCrl, base: &AuthenticatedCrl) -> bool {
     match (
         &delta.base_number,
         &delta.crl_number,
@@ -446,8 +466,29 @@ fn delta_applies(delta: &Parsed, base: &Parsed) -> bool {
     }
 }
 
-fn is_fresh(crl: &Parsed, now: u64, limits: RevocationLimits) -> Result<()> {
-    fresh(crl.this_update, crl.next_update, now, limits)
+/// A view whose freshness was checked for this evaluation's clock and policy.
+struct FreshCrl<'a> {
+    crl: &'a AuthenticatedCrl,
+    now: u64,
+    limits: RevocationLimits,
+}
+
+impl<'a> FreshCrl<'a> {
+    fn new(crl: &'a AuthenticatedCrl, now: u64, limits: RevocationLimits) -> Result<Self> {
+        fresh(crl.this_update, crl.next_update, now, limits)?;
+        Ok(Self { crl, now, limits })
+    }
+
+    // Lookup uses this same checked artifact, so a caller cannot accidentally
+    // combine freshness from one delta with a removal entry from another.
+    fn releases_hold(&self, certificate: &Certificate) -> Result<bool> {
+        ensure!(
+            self.crl.is_delta(),
+            "only a delta CRL can release certificateHold"
+        );
+        Ok(lookup(self.crl, certificate, self.now, self.limits)?
+            .is_some_and(|entry| !entry.revokes()))
+    }
 }
 
 /// Evaluate `crls` for `certificate`. `ancestry` runs from its already validated
@@ -474,7 +515,11 @@ pub(super) fn evaluate(
             Err(error) => diagnostics.push(format!("CRL {index}: {error:#}")),
         }
     }
-    let points = match certificate.tbs_certificate.get::<CrlDistributionPoints>()? {
+    let points = match certificate
+        .tbs_certificate
+        .get::<CrlDistributionPoints>()
+        .map_err(anyhow::Error::msg)?
+    {
         Some((_, points)) => {
             ensure!(
                 !points.0.is_empty() && points.0.len() <= 64,
@@ -490,7 +535,8 @@ pub(super) fn evaluate(
     };
     let is_ca = certificate
         .tbs_certificate
-        .get::<BasicConstraints>()?
+        .get::<BasicConstraints>()
+        .map_err(anyhow::Error::msg)?
         .is_some_and(|(_, constraints)| constraints.ca);
     // Per-CRL: whether it is bound to the issuer and the reasons it covers.
     let mut bindings = Vec::new();
@@ -554,19 +600,26 @@ pub(super) fn evaluate(
                 )
             });
         let mut effective = listing;
-        let mut delta_fresh = false;
+        let mut fresh_delta = None;
         if let Some((_, (delta_index, delta))) = latest {
-            match is_fresh(delta, now, limits) {
-                Ok(()) => delta_fresh = true,
-                Err(error) => diagnostics.push(format!("CRL {delta_index}: {error:#}")),
-            }
+            fresh_delta = match FreshCrl::new(delta, now, limits) {
+                Ok(fresh) => Some(fresh),
+                Err(error) => {
+                    diagnostics.push(format!("CRL {delta_index}: {error:#}"));
+                    None
+                }
+            };
             match lookup(delta, certificate, now, limits) {
                 Ok(Some(entry)) if entry.revokes() => effective = Some(entry),
                 Ok(Some(_)) => {
                     // removeFromCRL only releases a certificate on hold.
                     // Stale/future evidence may revoke, but cannot prove release.
-                    if delta_fresh
-                        && effective.is_some_and(|l| l.reason == CrlReason::CertificateHold)
+                    if effective.is_some_and(|l| l.reason == CrlReason::CertificateHold)
+                        && fresh_delta
+                            .as_ref()
+                            .map(|fresh| fresh.releases_hold(certificate))
+                            .transpose()?
+                            .unwrap_or(false)
                     {
                         effective = None;
                     }
@@ -584,14 +637,14 @@ pub(super) fn evaluate(
             used.insert(*index);
             continue;
         }
-        let base_fresh = match is_fresh(crl, now, limits) {
-            Ok(()) => true,
+        let base_fresh = match FreshCrl::new(crl, now, limits) {
+            Ok(_) => true,
             Err(error) => {
                 diagnostics.push(format!("CRL {index}: {error:#}"));
                 false
             }
         };
-        if (base_fresh || delta_fresh) && mask != 0 {
+        if (base_fresh || fresh_delta.is_some()) && mask != 0 {
             coverage |= mask;
             used.insert(*index);
         }
@@ -620,14 +673,15 @@ pub(super) fn evaluate(
 /// Parsing only: nothing here authenticates the CRL.
 pub(super) fn locations(bytes: &[u8]) -> Result<(bool, Vec<String>)> {
     use x509_cert::ext::pkix::FreshestCrl;
-    let list = CertificateList::from_der(bytes)?;
+    let list = CertificateList::from_der(bytes).map_err(anyhow::Error::msg)?;
     let mut delta = false;
     let mut out = Vec::new();
     for extension in list.tbs_cert_list.crl_extensions.iter().flatten() {
         match extension.extn_id.to_string().as_str() {
             OID_DELTA_INDICATOR => delta = true,
             "2.5.29.46" => {
-                let points = FreshestCrl::from_der(extension.extn_value.as_bytes())?;
+                let points = FreshestCrl::from_der(extension.extn_value.as_bytes())
+                    .map_err(anyhow::Error::msg)?;
                 ensure!(points.0.len() <= 64, "freshestCRL point count");
                 for point in &points.0 {
                     if let Some(DistributionPointName::FullName(names)) = &point.distribution_point

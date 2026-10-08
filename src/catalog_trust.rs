@@ -2,8 +2,11 @@
 //!
 //! The native backend uses the host's Authenticode policy and trust stores. It
 //! does not restrict the signer to Microsoft or establish CBS applicability.
+use alloc::string::String;
+use core::fmt;
 use serde::{Deserialize, Serialize};
-use std::{fmt, path::Path};
+#[cfg(feature = "std")]
+use std::path::Path;
 
 pub mod portable;
 
@@ -54,6 +57,7 @@ pub enum TrustStatus {
 }
 
 /// A native reference result, never a portable or Microsoft-specific claim.
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustReport {
     pub backend: String,
@@ -75,8 +79,12 @@ pub struct TrustReport {
 pub enum TrustError {
     BackendUnavailable,
     InvalidInput(String),
+    #[cfg(feature = "std")]
     Io(std::io::Error),
-    WindowsApi { operation: &'static str, code: u32 },
+    WindowsApi {
+        operation: &'static str,
+        code: u32,
+    },
 }
 impl fmt::Display for TrustError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -85,19 +93,22 @@ impl fmt::Display for TrustError {
                 f.write_str("Windows catalog trust backend unavailable on this platform")
             }
             Self::InvalidInput(message) => f.write_str(message),
+            #[cfg(feature = "std")]
             Self::Io(error) => error.fmt(f),
             Self::WindowsApi { operation, code } => write!(f, "{operation} failed: 0x{code:08x}"),
         }
     }
 }
-impl std::error::Error for TrustError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for TrustError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
+            #[cfg(feature = "std")]
             Self::Io(error) => Some(error),
             _ => None,
         }
     }
 }
+#[cfg(feature = "std")]
 impl From<std::io::Error> for TrustError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
@@ -107,6 +118,7 @@ impl From<std::io::Error> for TrustError {
 /// Verify one member against an explicitly supplied catalog without registering
 /// that catalog in the Windows catalog database. Rejections are report values;
 /// setup and I/O failures are errors. No verification UI is displayed.
+#[cfg(feature = "std")]
 pub fn verify_catalog_member(
     catalog: &Path,
     member: &Path,

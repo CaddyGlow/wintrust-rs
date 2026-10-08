@@ -16,7 +16,9 @@ include = [
   "/README.md",
   "/CHANGELOG.md",
   "/LICENSE",
+  "/tests/support/**",
   "/tests/api.rs",
+  "/tests/alloc_verifier.rs",
   "/tests/chain_alternatives.rs",
   "/tests/cms_detached.rs",
   "/tests/crl_evaluation.rs",
@@ -27,6 +29,7 @@ include = [
   "/tests/runtime_verifier.rs",
   "/tests/timestamp_issuer_candidates.rs",
   "/tests/timestamp_path_policy.rs",
+  "/tests/timestamp_accuracy.rs",
   "/tests/fixtures/root.der",
   "/tests/fixtures/catalog.cat",
   "/tests/fixtures/catalog-member.mum",
@@ -40,34 +43,45 @@ description = "Portable Rust catalog trust with Windows API name aliases"
 
 [features]
 default = []
-native-reference = []
-online = ["dep:reqwest"]
+std = [
+  "anyhow/std", "serde/std", "serde_json/std", "sha1/std", "sha2/std",
+  "hex/std", "der/std", "der/pem", "x509-cert/pem", "x509-cert/std",
+  "x509-ocsp/std", "rsa/std", "p256/std", "p384/std", "signature/std",
+  "roxmltree/std", "dep:libc",
+]
+native-reference = ["std"]
+online = ["std", "dep:reqwest"]
 
 [dependencies]
 hexspell = { package = "caddy-hexspell", version = "1.1.1", default-features = false }
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha1 = { version = "0.10", features = ["oid"] }
-sha2 = { version = "0.10", features = ["oid"] }
-hex = "0.4"
-der = { version = "0.7", features = ["alloc", "oid"] }
-x509-cert = "0.2.5"
-x509-ocsp = "0.2"
-rsa = { version = "0.9", features = ["sha2"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
-p384 = { version = "0.13", features = ["ecdsa"] }
-signature = "2.2"
-roxmltree = "0.20"
-libc = "0.2"
+anyhow = { version = "1.0", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+sha1 = { version = "0.10", default-features = false, features = ["oid"] }
+sha2 = { version = "0.10", default-features = false, features = ["oid"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+der = { version = "0.7", default-features = false, features = ["alloc", "oid"] }
+x509-cert = { version = "0.2.5", default-features = false }
+x509-ocsp = { version = "0.2", default-features = false }
+rsa = { version = "0.9", default-features = false, features = ["sha2", "u64_digit"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "alloc"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "alloc"] }
+signature = { version = "2.2", default-features = false, features = ["alloc"] }
+roxmltree = { version = "0.20", default-features = false, features = ["positions"] }
+libc = { version = "0.2", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = [
   "blocking",
   "rustls-tls-native-roots",
 ] }
-stringprep = "0.1"
+unicode-bidi = { version = "0.3", default-features = false, features = ["hardcoded-data"] }
+unicode-normalization = { version = "0.1", default-features = false }
+unicode-properties = "0.1"
 
 [dev-dependencies]
 tempfile = "3.23"
+p256 = { version = "0.13", default-features = false, features = ["pem"] }
+der = { version = "0.7", default-features = false, features = ["pem"] }
+x509-cert = { version = "0.2.5", default-features = false, features = ["pem"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -77,3 +91,27 @@ chunks_exact_to_as_chunks = "allow"
 
 [workspace]
 exclude = ["fuzz"]
+
+[[test]]
+name = "api"
+required-features = ["std"]
+
+[[test]]
+name = "cms_certificate_order"
+required-features = ["std"]
+
+[[test]]
+name = "microsoft_tsa_compatibility"
+required-features = ["std"]
+
+[[test]]
+name = "runtime_verifier"
+required-features = ["std"]
+
+[[test]]
+name = "timestamp_accuracy"
+required-features = ["std"]
+
+[[example]]
+name = "inspect_timestamp_certificates"
+required-features = ["std"]

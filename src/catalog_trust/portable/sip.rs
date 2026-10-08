@@ -1,5 +1,6 @@
 //! Portable, explicit catalog member hashing. Unknown SIP formats fail closed.
 use crate::catalog::Catalog;
+use alloc::{string::String, vec, vec::Vec};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -173,8 +174,10 @@ fn pe_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
 }
 
 fn flat_xml(bytes: &[u8]) -> Result<()> {
-    let text = std::str::from_utf8(bytes).context("flat XML member is not UTF-8")?;
-    let xml = roxmltree::Document::parse(text).context("invalid flat XML member")?;
+    let text = core::str::from_utf8(bytes).context("flat XML member is not UTF-8")?;
+    let xml = roxmltree::Document::parse(text)
+        .map_err(anyhow::Error::msg)
+        .context("invalid flat XML member")?;
     ensure!(
         xml.root_element().tag_name().name() == "assembly",
         "flat XML member must be an assembly MUM/manifest"
@@ -204,6 +207,18 @@ pub fn member_hash(
     algorithm: DigestAlgorithm,
     policy: &MemberHashPolicy,
 ) -> Result<String> {
+    Ok(hex::encode(member_hash_bytes(
+        bytes, kind, algorithm, policy,
+    )?))
+}
+
+/// Compute raw catalog-member digest bytes without a hex encoding round trip.
+pub fn member_hash_bytes(
+    bytes: &[u8],
+    kind: SipKind,
+    algorithm: DigestAlgorithm,
+    policy: &MemberHashPolicy,
+) -> Result<Vec<u8>> {
     ensure!(
         bytes.len() <= policy.max_member_bytes,
         "catalog member exceeds byte limit"
@@ -230,7 +245,7 @@ pub fn member_hash(
             for chunk in chunks {
                 hash.update(chunk);
             }
-            hex::encode(hash.finalize())
+            hash.finalize().to_vec()
         }};
     }
     Ok(match algorithm {

@@ -1,6 +1,7 @@
 //! Generic bounded CTL inspection. Parsing never authenticates a list or its entries.
 use crate::catalog::{self, CatalogError, CatalogLimits, Node};
-use catalog::{algorithm, bad, children, field, integer, node, oid, preflight, tagged, time};
+use alloc::{format, string::String, vec, vec::Vec};
+use catalog::{bad, children, field, integer, node, preflight, tagged, time};
 use der::asn1::ObjectIdentifier;
 
 /// A borrowed trust-list entry with exact encoded attributes, including unknown OIDs.
@@ -30,7 +31,7 @@ fn parse_attributes(n: Node<'_>) -> Result<Vec<CtlAttribute<'_>>, CatalogError> 
                 return Err(bad("empty CTL attribute values"));
             }
             Ok(CtlAttribute {
-                oid: typed_oid(oid(fields[0])?)?,
+                oid: crate::der::typed_oid(fields[0])?,
                 values: values.into_iter().map(|n| n.full).collect(),
             })
         })
@@ -50,10 +51,6 @@ pub struct ParsedCtl<'a> {
     pub entries: Vec<CtlEntry<'a>>,
     pub extensions: Option<&'a [u8]>,
     pub encoded: &'a [u8],
-}
-
-fn typed_oid(value: String) -> Result<ObjectIdentifier, CatalogError> {
-    value.parse().map_err(|_| bad("invalid object identifier"))
 }
 
 /// Dedicated CTL bootstrap policy. Embedded signer certificates are only issuer
@@ -100,11 +97,13 @@ fn unix_time(value: &str) -> anyhow::Result<u64> {
     let mut encoded = vec![tag, value.len() as u8];
     encoded.extend_from_slice(value.as_bytes());
     Ok(if tag == 0x17 {
-        der::asn1::UtcTime::from_der(&encoded)?
+        der::asn1::UtcTime::from_der(&encoded)
+            .map_err(anyhow::Error::msg)?
             .to_unix_duration()
             .as_secs()
     } else {
-        der::asn1::GeneralizedTime::from_der(&encoded)?
+        der::asn1::GeneralizedTime::from_der(&encoded)
+            .map_err(anyhow::Error::msg)?
             .to_unix_duration()
             .as_secs()
     })
@@ -149,7 +148,7 @@ pub fn authenticate(
     } else {
         verified.content_value
     };
-    let list = parse(&encoded, limits)?;
+    let list = parse(encoded, limits)?;
     ensure!(
         list.subject_usage.as_slice() == [policy.required_list_usage],
         "CTL list purpose mismatch"
@@ -203,7 +202,7 @@ pub fn authenticate(
         .collect::<anyhow::Result<Vec<_>>>()?;
     ensure!(!signer_paths.is_empty(), "CTL has no authenticated signers");
     Ok(AuthenticatedCtl {
-        encoded,
+        encoded: encoded.to_vec(),
         signer_paths,
         limits,
     })
@@ -223,7 +222,10 @@ pub fn parse(bytes: &[u8], limits: CatalogLimits) -> Result<ParsedCtl<'_>, Catal
     parse_node(root, limits)
 }
 
-fn parse_node(n: Node<'_>, limits: CatalogLimits) -> Result<ParsedCtl<'_>, CatalogError> {
+pub(crate) fn parse_node(
+    n: Node<'_>,
+    limits: CatalogLimits,
+) -> Result<ParsedCtl<'_>, CatalogError> {
     let fields = children(tagged(n, 0x30)?)?;
     let mut pos = 0;
     let version = if fields.first().is_some_and(|n| n.tag == 2) {
@@ -237,7 +239,7 @@ fn parse_node(n: Node<'_>, limits: CatalogLimits) -> Result<ParsedCtl<'_>, Catal
     }
     let subject_usage = children(field(&fields, pos, 0x30)?)?
         .into_iter()
-        .map(|n| typed_oid(oid(n)?))
+        .map(crate::der::typed_oid)
         .collect::<Result<Vec<_>, _>>()?;
     pos += 1;
     let list_identifier = if fields.get(pos).is_some_and(|n| n.tag == 4) {
@@ -267,7 +269,13 @@ fn parse_node(n: Node<'_>, limits: CatalogLimits) -> Result<ParsedCtl<'_>, Catal
     } else {
         None
     };
-    let subject_algorithm = typed_oid(algorithm(field(&fields, pos, 0x30)?)?)?;
+    let subject_algorithm = {
+        let alg = children(field(&fields, pos, 0x30)?)?;
+        if !(1..=2).contains(&alg.len()) {
+            return Err(bad("invalid AlgorithmIdentifier"));
+        }
+        crate::der::typed_oid(alg[0])?
+    };
     pos += 1;
     let mut entries = Vec::new();
     if fields.get(pos).is_some_and(|n| n.tag == 0x30) {

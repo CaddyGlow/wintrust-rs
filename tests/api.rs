@@ -8,7 +8,7 @@ use wintrust::{
     CryptCATAdminReleaseContext, WinVerifyTrust, crypt_cat_admin_acquire_context2,
     crypt_cat_admin_calc_hash_from_file_handle2,
     portable::{
-        PortableLimits, PortableVerifier,
+        PortableLimits, Verifier,
         sip::{DigestAlgorithm, MemberHashPolicy, SipKind},
     },
     win_verify_trust,
@@ -22,8 +22,7 @@ fn fixture(name: &str) -> PathBuf {
 
 #[test]
 fn windows_aliases_verify_the_complete_portable_policy_and_reject_modified_members() {
-    let verifier =
-        PortableVerifier::load(&fixture("policy.json"), PortableLimits::default()).unwrap();
+    let verifier = Verifier::load(&fixture("policy.json"), PortableLimits::default()).unwrap();
     let report = WinVerifyTrust(
         &verifier,
         &fixture("catalog.cat"),

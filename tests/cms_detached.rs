@@ -78,6 +78,10 @@ fn openssl_embedded_detached_direct_and_multiple_signers() {
             assert!(verify_cms_signed_data(&signature, DATA, content, false).is_err());
         }
         assert_eq!(report.content_value, data);
+        assert_eq!(report.content_der.as_ptr(), report.content_value.as_ptr());
+        if !embedded {
+            assert_eq!(report.content_value.as_ptr(), data.as_ptr());
+        }
         assert!(
             verify_cms_signed_data(
                 &signature,

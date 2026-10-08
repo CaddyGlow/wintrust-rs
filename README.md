@@ -12,7 +12,7 @@ RustCrypto signatures, pinned certificate chains, publisher authorization,
 timestamps, signed CRL/OCSP status, bounded online acquisition and PE/CAB/XML SIP
 hashes. `windows-uup` uses this crate and keeps compatibility module re-exports.
 
-Functions use snake_case. Windows spellings are direct `pub use` aliases of the
+With `std` enabled, functions use snake_case. Windows spellings are direct `pub use` aliases of the
 same function items:
 
 | Rust function | Windows alias |
@@ -29,11 +29,13 @@ or consult the host catalog database. Contexts are owned Rust values and also
 release automatically on drop. File hashing preserves the original seek position
 on success and verification errors.
 
+For this filesystem example, enable `features = ["std"]`.
+
 ```rust,no_run
 use std::path::Path;
-use wintrust::{WinVerifyTrust, portable::{PortableLimits, PortableVerifier, sip::SipKind}};
+use wintrust::{WinVerifyTrust, portable::{PortableLimits, Verifier, sip::SipKind}};
 
-let verifier = PortableVerifier::load(Path::new("trust.json"), PortableLimits::default())?;
+let verifier = Verifier::load(Path::new("trust.json"), PortableLimits::default())?;
 let report = WinVerifyTrust(&verifier, Path::new("update.cat"), Path::new("component.mum"), SipKind::FlatXml)?;
 assert!(report.trust_established);
 # Ok::<(), anyhow::Error>(())
@@ -45,12 +47,12 @@ it never changes `win_verify_trust` or its alias. The default dependency graph
 contains no HTTP client. Enable `online` explicitly for bounded CRL/OCSP
 acquisition using Rustls; online policies fail during loading without that feature.
 
-New callers should use `portable::ValidatedVerifier::load` or
-`portable::VerifierBuilder`. Runtime policy and pinned evidence have read-only
-accessors, configuration and certificate DER are validated during construction,
-and an omitted evaluation time is captured once when the verifier is built.
-`PortablePolicy` remains the versioned JSON input. The mutable `PortableVerifier`
-and Windows-name aliases remain available for source compatibility.
+Use `portable::Verifier::load` or `portable::VerifierBuilder` to construct an
+immutable runtime. Policy, limits and pinned evidence have read-only accessors.
+All constructors validate configuration, artifact pins and certificate DER.
+`PortablePolicy` remains the versioned JSON input. With `std`, an omitted evaluation time is
+captured once when the verifier is built; reusing it reuses that time. Build a
+new verifier to evaluate at a later time.
 
 `ctl::parse` inspects exact CTL bytes independently of catalog SIP member rules.
 It preserves borrowed entry identifiers and encodings, typed purpose/algorithm
@@ -69,9 +71,9 @@ and [file hashing](https://learn.microsoft.com/en-us/windows/win32/api/mscat/nf-
 
 CRL/OCSP acquisition is now optional. Applications using `PortableRevocationPolicy::Online`
 must enable `wintrust = { version = "0.1.2", features = ["online"] }`.
-Offline parsing and verification require no HTTP client. Existing function names,
-mutable-verifier compatibility APIs and Windows-name aliases remain available.
-New integrations should prefer the immutable runtime verifier.
+Offline parsing and verification require no HTTP client. Windows-name aliases remain available and accept the validated verifier.
+See the [Rust API migration](docs/portable-catalog-trust.md#rust-api-migration)
+for the unreleased verifier and timestamp changes.
 
 The published package includes synthetic test fixtures only. Microsoft-origin
 catalogs, manifests, certificates and cache-only CTL audit tests remain in the
@@ -90,3 +92,21 @@ portable verifier changes present during extraction. The MIT copyright
 notice is preserved in [LICENSE](LICENSE).
 
 Catalog parser fuzzing is maintained in [fuzz](fuzz/README.md).
+
+### `no_std` and optional platform support
+
+The default build uses `no_std` with `alloc`; an allocator is required. DER/CMS,
+CTL inspection, SIP hashing, certificate paths, timestamps, and offline revocation
+verification remain available. Construct `Verifier::from_artifact_reader` with
+hash-pinned artifact bytes and an explicit `PortablePolicy::verification_time`.
+Without `std`, artifact paths are opaque `String` identifiers resolved by your reader.
+
+Enable `std` for filesystem loading, automatic clock capture, `Verifier::builder`,
+and Windows-name API aliases:
+
+```toml
+wintrust = { version = "0.1.2", features = ["std"] }
+```
+
+`online` and `native-reference` automatically enable `std`. A default build is
+checked against the freestanding `x86_64-unknown-none` target in CI.

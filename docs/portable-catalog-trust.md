@@ -88,8 +88,9 @@ per-certificate diagnostics and rejected alternative paths.
 countersignatures must authenticate the actual signer signature and TSA chain.
 Advertised invalid timestamps reject verification. Unauthenticated signing time
 cannot extend certificate validity. `verification_time`, if present, is an
-explicit Unix time for reproducible as-of evaluation; otherwise current time is
-used. SHA-1 signatures require explicit `allow_sha1: true`.
+explicit Unix time for reproducible as-of evaluation; otherwise the current time
+is captured once during verifier construction. Reusing a verifier reuses this
+evaluation time. Build a new verifier for a later evaluation. SHA-1 signatures require explicit `allow_sha1: true`.
 
 ## Limits and behavior
 
@@ -131,3 +132,78 @@ issuers, unsupported constraints, signature parameters, timestamp binding,
 missing/stale/revoked status, network bounds and publication rejection. This does
 not establish automatic authenticated RTM file ownership or real checkpoint
 servicing correctness; see [external baseline selection](https://github.com/CaddyGlow/windows-uup/blob/main/docs/baseline-selection.md).
+
+## Rust API migration
+
+The unreleased Rust API uses a single immutable `portable::Verifier` in place of
+`PortableVerifier` and `ValidatedVerifier`. Use `Verifier::load`,
+`Verifier::from_policy`, or `Verifier::builder`. The injectable reader in
+`from_policy_with_reader` and `VerifierBuilder::build_with_reader` enforces the
+same validation as filesystem loading. Roots, intermediates, revocation evidence,
+policy and limits are available through borrowed read-only accessors. To change
+policy or the evaluation clock, construct a new verifier.
+
+```rust,no_run
+use std::path::Path;
+use wintrust::{WinVerifyTrust, portable::{PortableLimits, Verifier, sip::SipKind}};
+
+let verifier = Verifier::load(Path::new("trust.json"), PortableLimits::default())?;
+let report = WinVerifyTrust(&verifier, Path::new("update.cat"), Path::new("component.mum"), SipKind::FlatXml)?;
+assert_eq!(report.verification_time, verifier.evaluation_time());
+# Ok::<(), anyhow::Error>(())
+```
+
+Timestamp functions take `timestamp::TimestampOptions` rather than positional
+roots, time and policy arguments. The roots and evaluation time are required;
+optional settings default to strict SHA-2 verification and bounded path search.
+Issuer candidates assist path construction and never become anchors.
+
+```rust,no_run
+use wintrust::portable::{chain, timestamp::{self, TimestampOptions}};
+# let roots: Vec<Vec<u8>> = vec![];
+# let intermediates: Vec<Vec<u8>> = vec![];
+# let token: Vec<u8> = vec![];
+# let signature: Vec<u8> = vec![];
+let options = TimestampOptions {
+    issuer_candidates: &intermediates,
+    path_limits: chain::PathLimits::default(),
+    ..TimestampOptions::new(&roots, 1_791_117_219)
+};
+let stamp = timestamp::verify_rfc3161(&token, &signature, &options)?;
+# let _ = stamp;
+# Ok::<(), anyhow::Error>(())
+```
+
+`verify_rfc3161`, `verify_legacy`, `verify_timestamps`, and
+`verify_timestamps_with_path_policy` share these inputs. The former `_with_policy`
+wrappers are removed. RFC3161 validation selects a single path valid throughout
+the signed accuracy interval. Caller path policy runs before selection, including
+for exact-pinned Microsoft TSA compatibility. The main verifier checks TSA
+publisher authorization and revocation during this selection, so rejection can
+try another authenticated candidate path. Low-level timestamp verification
+requires caller policy for revocation.
+
+`SignedDataContent` and `VerifiedSignedData<'a>` borrow the exact CMS or detached
+payload bytes; signer and certificate reports remain owned. Keep the input alive
+while using content fields, or call `.to_vec()` to retain a payload independently.
+`AuthenticatedCtl` continues to own its authenticated list bytes.
+
+`member_hash_bytes` returns raw digest bytes. `member_hash` retains its hex-string
+result for inspection and persisted reports. Policy JSON schema and trust-report
+JSON fields retain their existing formats.
+
+### Freestanding builds
+
+The default crate uses `no_std` and `alloc`. Enable `std` to retain filesystem
+constructors, Windows-name aliases and automatic clock capture. `online` and
+`native-reference` imply `std`. In a freestanding environment, provide an
+allocator, set `PortablePolicy::verification_time`, and call
+`Verifier::from_artifact_reader(policy, limits, reader)`. The reader receives
+`&ArtifactRef` and a byte limit; it returns owned bytes. The verifier enforces
+pins, individual and aggregate budgets, DER validity and all trust policy checks.
+`ArtifactRef::path` is an opaque `String` without `std` and a `PathBuf` with it;
+its JSON representation is unchanged.
+
+The pinned upstream Unicode string preparation code is preserved as a private
+`alloc`-compatible module, with its licenses, so name-constraint normalization
+remains the same in both builds.

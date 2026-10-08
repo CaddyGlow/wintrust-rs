@@ -4,6 +4,7 @@
 //!
 //! Qualifiers are parsed for syntax by the certificate decoder but never
 //! influence a decision, and no qualifier set is retained or reported.
+use alloc::{vec, vec::Vec};
 use anyhow::{Context, Result, bail, ensure};
 use der::asn1::ObjectIdentifier;
 use x509_cert::{
@@ -264,14 +265,18 @@ impl Tree {
 }
 
 fn certificate_policies(cert: &Certificate) -> Result<Option<Vec<ObjectIdentifier>>> {
-    let Some((_, policies)) = cert.tbs_certificate.get::<CertificatePolicies>()? else {
+    let Some((_, policies)) = cert
+        .tbs_certificate
+        .get::<CertificatePolicies>()
+        .map_err(anyhow::Error::msg)?
+    else {
         return Ok(None);
     };
     ensure!(
         !policies.0.is_empty() && policies.0.len() <= 256,
         "certificate policies count"
     );
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = alloc::collections::BTreeSet::new();
     for information in &policies.0 {
         ensure!(
             seen.insert(information.policy_identifier),
@@ -284,7 +289,11 @@ fn certificate_policies(cert: &Certificate) -> Result<Option<Vec<ObjectIdentifie
 }
 
 fn policy_constraints(cert: &Certificate) -> Result<Option<PolicyConstraints>> {
-    let Some((_, constraints)) = cert.tbs_certificate.get::<PolicyConstraints>()? else {
+    let Some((_, constraints)) = cert
+        .tbs_certificate
+        .get::<PolicyConstraints>()
+        .map_err(anyhow::Error::msg)?
+    else {
         return Ok(None);
     };
     ensure!(
@@ -296,7 +305,11 @@ fn policy_constraints(cert: &Certificate) -> Result<Option<PolicyConstraints>> {
 }
 
 fn policy_mappings(cert: &Certificate) -> Result<Vec<(ObjectIdentifier, Vec<ObjectIdentifier>)>> {
-    let Some((_, mappings)) = cert.tbs_certificate.get::<PolicyMappings>()? else {
+    let Some((_, mappings)) = cert
+        .tbs_certificate
+        .get::<PolicyMappings>()
+        .map_err(anyhow::Error::msg)?
+    else {
         return Ok(Vec::new());
     };
     ensure!(
@@ -330,7 +343,8 @@ fn policy_mappings(cert: &Certificate) -> Result<Vec<(ObjectIdentifier, Vec<Obje
 fn inhibit_any_policy(cert: &Certificate) -> Result<Option<u64>> {
     Ok(cert
         .tbs_certificate
-        .get::<InhibitAnyPolicy>()?
+        .get::<InhibitAnyPolicy>()
+        .map_err(anyhow::Error::msg)?
         .map(|(_, value)| u64::from(value.0)))
 }
 

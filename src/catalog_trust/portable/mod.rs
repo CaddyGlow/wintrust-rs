@@ -6,26 +6,38 @@ pub mod crypto;
 pub mod policy;
 pub mod revocation;
 mod runtime;
-pub use runtime::{ValidatedVerifier, VerifierBuilder};
+#[cfg(feature = "std")]
+pub use runtime::VerifierBuilder;
 pub mod signed;
 pub mod sip;
 pub mod timestamp;
 
+use alloc::{string::String, vec::Vec};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "std")]
 use std::{
     fs::OpenOptions,
     io::Read,
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+/// An artifact location. Filesystem paths with `std`, opaque identifiers otherwise.
+#[cfg(feature = "std")]
+pub type ArtifactPath = PathBuf;
+#[cfg(not(feature = "std"))]
+pub type ArtifactPath = String;
+
+#[cfg(feature = "online")]
+use std::time::Instant;
 
 /// Explicit artifact binding; relative paths resolve beside the policy file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
-    pub path: PathBuf,
+    pub path: ArtifactPath,
     pub sha256: String,
 }
 
@@ -76,7 +88,8 @@ pub struct PortablePolicy {
     pub publisher: PublisherPolicy,
     pub revocation: PortableRevocationPolicy,
     pub timestamp: TimestampPolicy,
-    /// A reproducible evaluation time; absence uses the current Unix time.
+    /// A reproducible evaluation time. Required without `std`; with `std`,
+    /// absence captures the current Unix time during construction.
     pub verification_time: Option<u64>,
     #[serde(default)]
     pub allow_sha1: bool,
@@ -115,19 +128,29 @@ impl Default for PortableLimits {
     }
 }
 
-/// Legacy mutable verifier retained for source compatibility.
-/// Prefer [`ValidatedVerifier`] for immutable, validated runtime configuration.
-/// Loaded pinned inputs; construction validates all fingerprints and limits.
+/// Immutable verifier constructed from validated policy and hash-pinned evidence.
+/// With `std`, an omitted evaluation time is captured once during construction.
+/// Without `std`, callers must supply the evaluation time.
+///
+/// ```compile_fail
+/// # use wintrust::portable::Verifier;
+/// fn change(verifier: &mut Verifier) {
+///     verifier.policy.revocation = todo!();
+/// }
+/// ```
 #[derive(Debug)]
-pub struct PortableVerifier {
-    pub policy: PortablePolicy,
-    pub roots: Vec<Vec<u8>>,
-    pub intermediates: Vec<Vec<u8>>,
-    pub crls: Vec<Vec<u8>>,
-    pub ocsp_responses: Vec<Vec<u8>>,
-    pub limits: PortableLimits,
+pub struct Verifier {
+    policy: PortablePolicy,
+    roots: Vec<Vec<u8>>,
+    intermediates: Vec<Vec<u8>>,
+    crls: Vec<Vec<u8>>,
+    ocsp_responses: Vec<Vec<u8>>,
+    limits: PortableLimits,
+    evaluation_time: u64,
+    pinned_provenance: Vec<revocation::ArtifactProvenance>,
 }
 
+#[cfg(feature = "std")]
 pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -151,8 +174,9 @@ pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-impl PortableVerifier {
+impl Verifier {
     /// Load a policy plus hash-pinned DER roots, intermediates and status evidence.
+    #[cfg(feature = "std")]
     pub fn load(policy_path: &Path, limits: PortableLimits) -> Result<Self> {
         let bytes = read_bounded(policy_path, limits.max_policy_bytes)?;
         let policy: PortablePolicy = serde_json::from_slice(&bytes)?;
@@ -162,6 +186,7 @@ impl PortableVerifier {
             limits,
         )
     }
+    #[cfg(feature = "std")]
     pub fn from_policy(
         policy: PortablePolicy,
         base: &Path,
@@ -174,12 +199,42 @@ impl PortableVerifier {
     /// The common loader still enforces every artifact pin, count and aggregate
     /// limit. This permits access-inhibited native observations without changing
     /// cryptographic verification or granting trust to caller assertions.
+    #[cfg(feature = "std")]
     pub fn from_policy_with_reader(
         policy: PortablePolicy,
         base: &Path,
         limits: PortableLimits,
         mut reader: impl FnMut(&Path, usize) -> Result<Vec<u8>>,
     ) -> Result<Self> {
+        Self::from_artifact_reader(policy, limits, |artifact, limit| {
+            reader(&base.join(&artifact.path), limit)
+        })
+    }
+
+    /// Construct from pinned artifacts supplied by the caller. Without `std`,
+    /// policy.verification_time must specify the evaluation clock explicitly.
+    pub fn from_artifact_reader(
+        mut policy: PortablePolicy,
+        limits: PortableLimits,
+        mut reader: impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>>,
+    ) -> Result<Self> {
+        ensure!(
+            limits.max_policy_bytes > 0
+                && limits.max_artifact_bytes > 0
+                && limits.max_artifacts > 0
+                && limits.max_total_artifact_bytes > 0
+                && limits.max_member_bytes > 0,
+            "runtime byte and count limits must be positive"
+        );
+        ensure!(
+            policy.revocation != PortableRevocationPolicy::Online || limits.max_online_seconds > 0,
+            "online policy requires a positive deadline"
+        );
+        ensure!(
+            policy.revocation == PortableRevocationPolicy::Disabled
+                || policy.revocation_max_age_seconds > 0,
+            "revocation freshness age must be positive"
+        );
         ensure!(
             policy.revocation != PortableRevocationPolicy::Online || cfg!(feature = "online"),
             "online policy requires the wintrust online feature"
@@ -218,7 +273,7 @@ impl PortableVerifier {
                             && artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
                         "invalid artifact SHA-256"
                     );
-                    let bytes = reader(&base.join(&artifact.path), limits.max_artifact_bytes)?;
+                    let bytes = reader(artifact, limits.max_artifact_bytes)?;
                     ensure!(
                         bytes.len() <= limits.max_artifact_bytes,
                         "trust artifact exceeds individual byte limit"
@@ -233,7 +288,7 @@ impl PortableVerifier {
                     ensure!(
                         hex::encode(Sha256::digest(&bytes)) == artifact.sha256.to_ascii_lowercase(),
                         "trust artifact SHA-256 mismatch: {}",
-                        artifact.path.display()
+                        artifact.sha256
                     );
                     Ok(bytes)
                 })
@@ -243,6 +298,34 @@ impl PortableVerifier {
         let intermediates = load(&policy.intermediates)?;
         let crls = load(&policy.crls)?;
         let ocsp_responses = load(&policy.ocsp_responses)?;
+        for certificate in roots.iter().chain(&intermediates) {
+            use der::Decode;
+            x509_cert::Certificate::from_der(certificate)
+                .map_err(anyhow::Error::msg)
+                .context("invalid runtime certificate DER")?;
+        }
+        let evaluation_time = match policy.verification_time {
+            Some(time) => time,
+            #[cfg(feature = "std")]
+            None => SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            #[cfg(not(feature = "std"))]
+            None => anyhow::bail!("no_std verification requires an explicit verification_time"),
+        };
+        policy.verification_time = Some(evaluation_time);
+        let crl_labels = artifact_labels(&policy.crls);
+        let ocsp_labels = artifact_labels(&policy.ocsp_responses);
+        let pinned_provenance = revocation::pinned_provenance_labels(
+            &crl_labels
+                .iter()
+                .map(String::as_str)
+                .zip(crls.iter().map(Vec::as_slice))
+                .collect::<Vec<_>>(),
+            &ocsp_labels
+                .iter()
+                .map(String::as_str)
+                .zip(ocsp_responses.iter().map(Vec::as_slice))
+                .collect::<Vec<_>>(),
+        )?;
         Ok(Self {
             policy,
             roots,
@@ -250,13 +333,13 @@ impl PortableVerifier {
             crls,
             ocsp_responses,
             limits,
+            evaluation_time,
+            pinned_provenance,
         })
     }
-    pub fn evaluation_time(&self) -> Result<u64> {
-        self.policy
-            .verification_time
-            .map(Ok)
-            .unwrap_or_else(|| Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()))
+    /// The evaluation time captured when this verifier was constructed.
+    pub fn evaluation_time(&self) -> u64 {
+        self.evaluation_time
     }
 }
 
@@ -270,7 +353,7 @@ fn validate_tsa_compatibility_policy(policy: &PortablePolicy) -> Result<()> {
         pins.is_empty() || policy.publisher == PublisherPolicy::MicrosoftWindows,
         "noncritical TSA compatibility requires MicrosoftWindows publisher policy"
     );
-    let mut unique = std::collections::BTreeSet::new();
+    let mut unique = alloc::collections::BTreeSet::new();
     for pin in pins {
         ensure!(
             pin.len() == 64
@@ -328,16 +411,29 @@ pub struct PortableTrustReport {
     pub trust_established: bool,
 }
 
-/// Pair each pinned artifact path with its loaded bytes.
-fn pinned_artifacts<'a>(refs: &'a [ArtifactRef], data: &'a [Vec<u8>]) -> Vec<(&'a Path, &'a [u8])> {
+fn artifact_labels(refs: &[ArtifactRef]) -> Vec<String> {
     refs.iter()
-        .map(|artifact| artifact.path.as_path())
-        .zip(data.iter().map(Vec::as_slice))
+        .map(|artifact| {
+            #[cfg(feature = "std")]
+            {
+                artifact.path.to_string_lossy().into_owned()
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                artifact.path.clone()
+            }
+        })
         .collect()
 }
 
-impl PortableVerifier {
+#[cfg(feature = "online")]
+type VerificationStart = Instant;
+#[cfg(not(feature = "online"))]
+type VerificationStart = ();
+
+impl Verifier {
     /// Verify an explicit catalog/member pair entirely through portable Rust.
+    #[cfg(feature = "std")]
     pub fn verify_catalog_member(
         &self,
         catalog_path: &Path,
@@ -369,8 +465,10 @@ impl PortableVerifier {
         member_bytes: &[u8],
         kind: sip::SipKind,
     ) -> Result<PortableTrustReport> {
-        validate_tsa_compatibility_policy(&self.policy)?;
+        #[cfg(feature = "online")]
         let started = Instant::now();
+        #[cfg(not(feature = "online"))]
+        let started = ();
         let catalog = crate::catalog::parse(catalog_bytes, Default::default())?;
         let signed = signed::verify_signed_data_with_policy(
             catalog_bytes,
@@ -379,7 +477,7 @@ impl PortableVerifier {
         )
         .context("catalog signature verification")?;
         ensure!(
-            hex::encode(&signed.content_der) == catalog.ctl.encoded_hex,
+            hex::encode(signed.content_der) == catalog.ctl.encoded_hex,
             "signed CTL differs from inspected CTL"
         );
         let matches = sip::match_catalog_member(
@@ -395,21 +493,38 @@ impl PortableVerifier {
             !matches.is_empty(),
             "member digest is not bound to the signed catalog"
         );
-        let now = self.evaluation_time()?;
+        let now = self.evaluation_time();
         let mut certificates = signed.certificates;
         certificates.extend(self.intermediates.iter().cloned());
         let mut reports = Vec::new();
         for signer in signed.signers {
+            let mut timestamp_revocation = None;
             let timestamp = if self.policy.timestamp == TimestampPolicy::Ignore {
                 None
             } else {
-                timestamp::verify_timestamps_with_compatibility(
+                let options = timestamp::TimestampOptions {
+                    issuer_candidates: &certificates,
+                    allow_sha1: self.policy.allow_sha1,
+                    noncritical_tsa_certificate_sha256: &self
+                        .policy
+                        .noncritical_tsa_certificate_sha256,
+                    ..timestamp::TimestampOptions::new(&self.roots, now)
+                };
+                timestamp::verify_timestamps_with_path_policy(
                     &signer,
-                    &certificates,
-                    &self.roots,
-                    now,
-                    self.policy.allow_sha1,
-                    &self.policy.noncritical_tsa_certificate_sha256,
+                    &options,
+                    |candidate, time| {
+                        if self.policy.publisher == PublisherPolicy::MicrosoftWindows {
+                            ensure!(
+                                MICROSOFT_ROOTS.contains(&candidate.anchor_sha256.as_str()),
+                                "timestamp does not chain to an authorized Microsoft root"
+                            );
+                        }
+                        let status =
+                            self.check_revocation(&candidate.chain_der, time, now, started)?;
+                        timestamp_revocation = status;
+                        Ok(())
+                    },
                 )
                 .context("catalog timestamp verification")?
             };
@@ -460,19 +575,6 @@ impl PortableVerifier {
                 },
             )
             .context("catalog signer chain verification")?;
-            if self.policy.publisher == PublisherPolicy::MicrosoftWindows
-                && let Some(stamp) = &timestamp
-            {
-                ensure!(
-                    MICROSOFT_ROOTS.contains(&stamp.tsa_anchor_sha256.as_str()),
-                    "timestamp does not chain to an authorized Microsoft root"
-                );
-            }
-            let timestamp_revocation = timestamp
-                .as_ref()
-                .map(|stamp| self.check_revocation(&stamp.chain_der, stamp.unix_time, now, started))
-                .transpose()?
-                .flatten();
             reports.push(PortableSignerReport {
                 signer_certificate_sha256: hex::encode(Sha256::digest(&signer.certificate_der)),
                 signature_time,
@@ -510,7 +612,7 @@ impl PortableVerifier {
         path: &[Vec<u8>],
         signature_time: u64,
         now: u64,
-        started: Instant,
+        _started: VerificationStart,
     ) -> Result<Option<revocation::RevocationReport>> {
         if self.policy.revocation == PortableRevocationPolicy::Disabled {
             return Ok(None);
@@ -520,21 +622,23 @@ impl PortableVerifier {
             max_age_seconds: self.policy.revocation_max_age_seconds,
             ..Default::default()
         };
-        let mut crls = self.crls.clone();
-        let mut ocsp = self.ocsp_responses.clone();
-        let mut diagnostics = Vec::new();
-        let mut provenance = revocation::pinned_provenance(
-            &pinned_artifacts(&self.policy.crls, &self.crls),
-            &pinned_artifacts(&self.policy.ocsp_responses, &self.ocsp_responses),
-        )?;
+        #[cfg(feature = "online")]
+        let mut acquired = revocation::AcquiredRevocation::default();
+        #[cfg(not(feature = "online"))]
+        let acquired = revocation::AcquiredRevocation::default();
+        #[cfg(feature = "online")]
+        let mut provenance = self.pinned_provenance.clone();
+        #[cfg(not(feature = "online"))]
+        let provenance = self.pinned_provenance.clone();
+        #[cfg(feature = "online")]
         if self.policy.revocation == PortableRevocationPolicy::Online {
             let remaining = self
                 .limits
                 .max_online_seconds
-                .checked_sub(started.elapsed().as_secs())
+                .checked_sub(_started.elapsed().as_secs())
                 .filter(|seconds| *seconds > 0)
                 .context("portable online verification deadline exceeded")?;
-            let acquired = revocation::acquire_chain_revocation_with_signers(
+            acquired = revocation::acquire_chain_revocation_with_signers(
                 path,
                 &self.intermediates,
                 now,
@@ -544,12 +648,21 @@ impl PortableVerifier {
                     ..Default::default()
                 },
             )?;
-            crls.extend(acquired.crls);
-            ocsp.extend(acquired.ocsp_responses);
-            diagnostics = acquired.diagnostics;
-            provenance.extend(acquired.provenance);
+            provenance.append(&mut acquired.provenance);
         }
-        let mut report = revocation::verify_chain_revocation_with_signers(
+        let crls = self
+            .crls
+            .iter()
+            .chain(&acquired.crls)
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let ocsp = self
+            .ocsp_responses
+            .iter()
+            .chain(&acquired.ocsp_responses)
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let mut report = revocation::verify_chain_revocation_with_borrowed_artifacts(
             path,
             &crls,
             &ocsp,
@@ -560,7 +673,7 @@ impl PortableVerifier {
         )?;
         report.provenance = provenance;
         if let Some(certificate) = report.certificates.first_mut() {
-            certificate.diagnostics.extend(diagnostics);
+            certificate.diagnostics.extend(acquired.diagnostics);
         }
         ensure!(
             report.status == revocation::RevocationStatus::Good,
@@ -571,13 +684,13 @@ impl PortableVerifier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod reader_tests {
     use super::*;
 
     #[test]
     fn injected_artifact_reader_cannot_bypass_pins_or_budgets() -> Result<()> {
-        let bytes = vec![1_u8, 2, 3];
+        let bytes = include_bytes!("../../../tests/fixtures/root.der").to_vec();
         let policy = PortablePolicy {
             schema_version: 1,
             roots: vec![ArtifactRef {
@@ -596,7 +709,7 @@ mod reader_tests {
             revocation_max_age_seconds: default_revocation_age(),
         };
         let base = Path::new("source");
-        let verified = PortableVerifier::from_policy_with_reader(
+        let verified = Verifier::from_policy_with_reader(
             policy.clone(),
             base,
             PortableLimits::default(),
@@ -607,7 +720,7 @@ mod reader_tests {
         )?;
         assert_eq!(verified.roots, vec![bytes.clone()]);
         assert!(
-            PortableVerifier::from_policy_with_reader(
+            Verifier::from_policy_with_reader(
                 policy.clone(),
                 base,
                 PortableLimits::default(),
@@ -630,7 +743,7 @@ mod reader_tests {
             },
         ] {
             assert!(
-                PortableVerifier::from_policy_with_reader(policy.clone(), base, limits, |_, _| Ok(
+                Verifier::from_policy_with_reader(policy.clone(), base, limits, |_, _| Ok(
                     bytes.clone()
                 ),)
                 .is_err()

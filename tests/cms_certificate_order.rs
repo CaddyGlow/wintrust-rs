@@ -1,13 +1,13 @@
 use std::{fs, path::PathBuf};
-use wintrust::portable::{PortableLimits, PortableVerifier, sip::SipKind};
+use wintrust::portable::{PortableLimits, Verifier, sip::SipKind};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/microsoft-ber-certificates")
         .join(name)
 }
-fn verifier() -> PortableVerifier {
-    PortableVerifier::load(&fixture("policy.json"), PortableLimits::default()).unwrap()
+fn verifier() -> Verifier {
+    Verifier::load(&fixture("policy.json"), PortableLimits::default()).unwrap()
 }
 fn children(bytes: &[u8], start: usize) -> Vec<(u8, std::ops::Range<usize>)> {
     let mut result = Vec::new();

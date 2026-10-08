@@ -17,6 +17,28 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-features --locked
       - run: cargo package --locked
+      - name: Compile tests from packaged source
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          archive=$(find target/package -maxdepth 1 -name 'wintrust-*.crate' -print -quit)
+          mkdir -p target/package-test
+          tar -xzf "$archive" -C target/package-test
+          manifest=$(find target/package-test -mindepth 2 -maxdepth 2 -name Cargo.toml -print -quit)
+          cargo test --manifest-path "$manifest" --all-features --locked --no-run
+  no-std:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Check alloc-only library on a freestanding target
+        run: cargo check --lib --no-default-features --target x86_64-unknown-none --locked
+      - name: Test the default alloc-only library
+        run: cargo test --no-default-features --locked
+      - name: Check optional standard-library support
+        run: cargo check --lib --no-default-features --features std --locked
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:

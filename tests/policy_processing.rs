@@ -1,17 +1,12 @@
 //! RFC 5280 6.1 certificate policy processing on synthetic signed P-256 paths.
-use der::{
-    Decode, Encode,
-    asn1::{ObjectIdentifier, OctetString},
-};
-use p256::{
-    ecdsa::{Signature, SigningKey},
-    pkcs8::EncodePublicKey,
-};
-use signature::Signer;
+mod support;
+#[cfg(feature = "std")]
+use der::Decode;
+use der::{Encode, asn1::ObjectIdentifier};
+use support::{extension, sign};
 use wintrust::portable::{
     chain::{self, PathLimits, PathOptions},
     policy::PolicyOptions,
-    signed,
 };
 use x509_cert::{
     Certificate,
@@ -34,13 +29,7 @@ const ANY: &str = "2.5.29.32.0";
 fn oid(s: &str) -> ObjectIdentifier {
     s.parse().unwrap()
 }
-fn extension(id: &str, bytes: Vec<u8>, critical: bool) -> Extension {
-    Extension {
-        extn_id: oid(id),
-        critical,
-        extn_value: OctetString::new(bytes).unwrap(),
-    }
-}
+
 fn policies(list: &[&str]) -> Extension {
     extension(
         "2.5.29.32",
@@ -89,49 +78,17 @@ fn inhibit_any(skip: u32) -> Extension {
     extension("2.5.29.54", InhibitAnyPolicy(skip).to_der().unwrap(), true)
 }
 
-fn prepare(mut cert: Certificate) -> Certificate {
-    let key = SigningKey::from_bytes((&[7; 32]).into()).unwrap();
-    let public = key.verifying_key().to_public_key_der().unwrap();
-    cert.tbs_certificate.subject_public_key_info =
-        x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(public.as_bytes()).unwrap();
-    cert.tbs_certificate.signature.oid = "1.2.840.10045.4.3.2".parse().unwrap();
-    cert.tbs_certificate.signature.parameters = None;
-    cert.signature_algorithm = cert.tbs_certificate.signature.clone();
-    cert.tbs_certificate
-        .extensions
-        .as_mut()
-        .unwrap()
-        .retain(|e| {
-            !matches!(
-                e.extn_id.to_string().as_str(),
-                "2.5.29.35"
-                    | "2.5.29.14"
-                    | "2.5.29.17"
-                    | "2.5.29.30"
-                    | "2.5.29.32"
-                    | "2.5.29.33"
-                    | "2.5.29.36"
-                    | "2.5.29.54"
-            )
-        });
-    cert
-}
-fn sign(mut cert: Certificate) -> Vec<u8> {
-    let key = SigningKey::from_bytes((&[7; 32]).into()).unwrap();
-    let signature: Signature = key.sign(&cert.tbs_certificate.to_der().unwrap());
-    cert.signature = der::asn1::BitString::from_bytes(signature.to_der().as_bytes()).unwrap();
-    cert.to_der().unwrap()
-}
 fn templates() -> (Certificate, Certificate) {
-    let cms = signed::verify_signed_data(
-        include_bytes!("fixtures/catalog.cat"),
-        "1.3.6.1.4.1.311.10.1",
-    )
-    .unwrap();
-    (
-        prepare(Certificate::from_der(&cms.signers[0].certificate_der).unwrap()),
-        prepare(Certificate::from_der(include_bytes!("fixtures/root.der")).unwrap()),
-    )
+    support::templates(&[
+        "2.5.29.35",
+        "2.5.29.14",
+        "2.5.29.17",
+        "2.5.29.30",
+        "2.5.29.32",
+        "2.5.29.33",
+        "2.5.29.36",
+        "2.5.29.54",
+    ])
 }
 
 /// One path position. The first spec is the anchor and the last the end entity.
@@ -592,6 +549,7 @@ fn rejected_alternative_paths_are_retained_in_the_selected_report() {
 
 #[test]
 #[ignore = "independent OpenSSL oracle; invoke explicitly in the development shell"]
+#[cfg(feature = "std")]
 fn openssl_agrees_on_policy_outcomes() {
     use der::EncodePem;
     struct Case {

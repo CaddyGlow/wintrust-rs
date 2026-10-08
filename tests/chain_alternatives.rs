@@ -1,3 +1,4 @@
+mod support;
 use der::{Decode, Encode};
 use wintrust::portable::{
     chain::{self, PathLimits},
@@ -108,32 +109,9 @@ fn unsupported_constraints_and_wrong_purpose_still_fail() {
 }
 
 fn signed_alternatives() -> (Vec<u8>, Vec<Vec<u8>>) {
-    use p256::pkcs8::EncodePublicKey;
-    use signature::Signer;
-    let key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
-    let public = key.verifying_key().to_public_key_der().unwrap();
     let (leaf, _, roots) = fixture();
-    let prepare = |mut certificate: Certificate| {
-        certificate.tbs_certificate.subject_public_key_info =
-            x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(public.as_bytes()).unwrap();
-        certificate.tbs_certificate.signature.oid = "1.2.840.10045.4.3.2".parse().unwrap();
-        certificate.tbs_certificate.signature.parameters = None;
-        certificate.signature_algorithm = certificate.tbs_certificate.signature.clone();
-        certificate
-            .tbs_certificate
-            .extensions
-            .as_mut()
-            .unwrap()
-            .retain(|e| !matches!(e.extn_id.to_string().as_str(), "2.5.29.35" | "2.5.29.14"));
-        certificate
-    };
-    let sign = |mut certificate: Certificate| {
-        let signature: p256::ecdsa::Signature =
-            key.sign(&certificate.tbs_certificate.to_der().unwrap());
-        certificate.signature =
-            der::asn1::BitString::from_bytes(signature.to_der().as_bytes()).unwrap();
-        certificate.to_der().unwrap()
-    };
+    let prepare = |certificate| support::prepare(certificate, &["2.5.29.35", "2.5.29.14"]);
+    let sign = support::sign;
     let root = prepare(Certificate::from_der(&roots[0]).unwrap());
     let mut alternative = root.clone();
     alternative.tbs_certificate.serial_number =

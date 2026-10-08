@@ -1,7 +1,5 @@
 use std::path::PathBuf;
-use wintrust::portable::{
-    PortableLimits, PortablePolicy, PortableVerifier, PublisherPolicy, sip::SipKind,
-};
+use wintrust::portable::{PortableLimits, PortablePolicy, PublisherPolicy, Verifier, sip::SipKind};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -11,10 +9,10 @@ fn fixture(name: &str) -> PathBuf {
 fn policy() -> PortablePolicy {
     serde_json::from_slice(&std::fs::read(fixture("policy.json")).unwrap()).unwrap()
 }
-fn verifier(policy: PortablePolicy) -> anyhow::Result<PortableVerifier> {
-    PortableVerifier::from_policy(policy, &fixture(""), PortableLimits::default())
+fn verifier(policy: PortablePolicy) -> anyhow::Result<Verifier> {
+    Verifier::from_policy(policy, &fixture(""), PortableLimits::default())
 }
-fn verify(engine: &PortableVerifier) -> anyhow::Result<wintrust::portable::PortableTrustReport> {
+fn verify(engine: &Verifier) -> anyhow::Result<wintrust::portable::PortableTrustReport> {
     engine.verify_catalog_member(
         &fixture("catalog.cat"),
         &fixture("member.manifest"),
@@ -52,6 +50,17 @@ fn exact_microsoft_tsa_pin_authenticates_real_catalog_membership_and_reports_com
         report.noncritical_tsa_certificate_sha256,
         configuration.noncritical_tsa_certificate_sha256
     );
+    // The genuine Microsoft CA exercises the measured critical policy profile,
+    // independently of the synthetic policy unit test in the packaged library.
+    assert!(report.signers.iter().all(|signer| {
+        signer
+            .timestamp
+            .as_ref()
+            .unwrap()
+            .microsoft_timestamp_policy_certificate_sha256
+            .as_deref()
+            == Some("86ec118d1ee69670a46e2be29c4b4208be043e36600d4e1dd3f3d515ca119020")
+    }));
     assert!(report.signers.iter().all(|s| {
         s.timestamp
             .as_ref()

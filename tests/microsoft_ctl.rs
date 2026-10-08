@@ -47,7 +47,7 @@ fn real_public_ctl_crypto_and_optional_attributes_preserve_metadata() {
             .unwrap()
             .1;
         assert_eq!(eku.0[0].to_string(), "1.3.6.1.4.1.311.10.3.9");
-        let list = ctl::parse(&verified.content_der, Default::default()).unwrap();
+        let list = ctl::parse(verified.content_der, Default::default()).unwrap();
         assert_eq!(list.subject_usage[0].to_string(), usage);
         assert_eq!(list.subject_algorithm.to_string(), algorithm);
         assert_eq!(list.entries.len(), count);

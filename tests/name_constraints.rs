@@ -1,22 +1,20 @@
 //! Synthetic P-256 signed paths exercise RFC5280 name constraints without
 //! trusting certificate names or weakening certificate signature checks.
+mod support;
+#[cfg(feature = "std")]
+use der::Decode;
+#[cfg(feature = "std")]
+use der::EncodePem;
 use der::{
-    Decode, Encode, EncodePem,
+    Encode,
     asn1::{Ia5String, OctetString},
 };
-use p256::{
-    ecdsa::{Signature, SigningKey},
-    pkcs8::EncodePublicKey,
-};
-use signature::Signer;
-use wintrust::portable::{chain, signed};
+use support::{extension, sign};
+use wintrust::portable::chain;
 use x509_cert::{
     Certificate,
-    ext::{
-        Extension,
-        pkix::{
-            NameConstraints, SubjectAltName, constraints::name::GeneralSubtree, name::GeneralName,
-        },
+    ext::pkix::{
+        NameConstraints, SubjectAltName, constraints::name::GeneralSubtree, name::GeneralName,
     },
 };
 
@@ -49,49 +47,9 @@ fn constraints(permitted: Vec<GeneralName>, excluded: Vec<GeneralName>) -> NameC
             .then(|| excluded.into_iter().map(subtree).collect()),
     }
 }
-fn extension(oid: &str, bytes: Vec<u8>, critical: bool) -> Extension {
-    Extension {
-        extn_id: oid.parse().unwrap(),
-        critical,
-        extn_value: OctetString::new(bytes).unwrap(),
-    }
-}
-fn prepare(mut cert: Certificate) -> Certificate {
-    let key = SigningKey::from_bytes((&[7; 32]).into()).unwrap();
-    let public = key.verifying_key().to_public_key_der().unwrap();
-    cert.tbs_certificate.subject_public_key_info =
-        x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(public.as_bytes()).unwrap();
-    cert.tbs_certificate.signature.oid = "1.2.840.10045.4.3.2".parse().unwrap();
-    cert.tbs_certificate.signature.parameters = None;
-    cert.signature_algorithm = cert.tbs_certificate.signature.clone();
-    cert.tbs_certificate
-        .extensions
-        .as_mut()
-        .unwrap()
-        .retain(|e| {
-            !matches!(
-                e.extn_id.to_string().as_str(),
-                "2.5.29.35" | "2.5.29.14" | "2.5.29.17" | "2.5.29.30"
-            )
-        });
-    cert
-}
-fn sign(mut cert: Certificate) -> Vec<u8> {
-    let key = SigningKey::from_bytes((&[7; 32]).into()).unwrap();
-    let signature: Signature = key.sign(&cert.tbs_certificate.to_der().unwrap());
-    cert.signature = der::asn1::BitString::from_bytes(signature.to_der().as_bytes()).unwrap();
-    cert.to_der().unwrap()
-}
+
 fn templates() -> (Certificate, Certificate) {
-    let cms = signed::verify_signed_data(
-        include_bytes!("fixtures/catalog.cat"),
-        "1.3.6.1.4.1.311.10.1",
-    )
-    .unwrap();
-    (
-        prepare(Certificate::from_der(&cms.signers[0].certificate_der).unwrap()),
-        prepare(Certificate::from_der(include_bytes!("fixtures/root.der")).unwrap()),
-    )
+    support::templates(&["2.5.29.35", "2.5.29.14", "2.5.29.17", "2.5.29.30"])
 }
 fn path(names: Vec<GeneralName>, nc: NameConstraints) -> (Vec<u8>, Vec<u8>) {
     let (mut leaf, mut root) = templates();
@@ -550,6 +508,7 @@ fn legacy_subject_email_is_constrained_when_san_is_absent() {
 
 #[test]
 #[ignore = "independent OpenSSL oracle; invoke explicitly in the development shell"]
+#[cfg(feature = "std")]
 fn openssl_agrees_on_supported_name_constraint_outcomes() {
     let cases = [
         (

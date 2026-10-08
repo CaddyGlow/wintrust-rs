@@ -5,7 +5,7 @@ use std::{
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
-use wintrust::portable::{chain, signed::VerifiedSigner, timestamp};
+use wintrust::portable::{signed::VerifiedSigner, timestamp};
 
 fn openssl(dir: &Path, args: &[&str]) {
     let output = Command::new("openssl")
@@ -191,25 +191,19 @@ fn supplied_intermediate_completes_tsa_path_and_rejected_root_tries_alternative(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    assert!(timestamp::verify_timestamps_with_policy(&signer, &[], &roots, now, false).is_err());
-    let supplied = timestamp::verify_timestamps_with_policy(&signer, &issuers, &roots, now, false)
+    let mut options = timestamp::TimestampOptions::new(&roots, now);
+    assert!(timestamp::verify_timestamps(&signer, &options).is_err());
+    options.issuer_candidates = &issuers;
+    let supplied = timestamp::verify_timestamps(&signer, &options)
         .unwrap()
         .unwrap();
     assert_eq!(supplied.chain_der.len(), 3);
     let mut paths = 0;
-    let verified = timestamp::verify_timestamps_with_path_policy(
-        &signer,
-        &issuers,
-        &roots,
-        now,
-        false,
-        chain::PathLimits::default(),
-        |_, _| {
-            paths += 1;
-            anyhow::ensure!(paths > 1, "first TSA root rejected by policy");
-            Ok(())
-        },
-    )
+    let verified = timestamp::verify_timestamps_with_path_policy(&signer, &options, |_, _| {
+        paths += 1;
+        anyhow::ensure!(paths > 1, "first TSA root rejected by policy");
+        Ok(())
+    })
     .unwrap()
     .unwrap();
     assert_eq!(paths, 2);

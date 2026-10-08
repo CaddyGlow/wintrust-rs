@@ -1,8 +1,11 @@
 //! RFC 5280 CRL evaluation: direct, scoped, indirect and delta CRLs on
 //! synthetic P-256 signed evidence.
+mod support;
+#[cfg(feature = "std")]
+use der::EncodePem;
 use der::{
-    Decode, Encode, EncodePem,
-    asn1::{ObjectIdentifier, OctetString, Uint},
+    Decode, Encode,
+    asn1::{ObjectIdentifier, Uint},
     flagset::FlagSet,
 };
 use p256::{
@@ -11,10 +14,8 @@ use p256::{
 };
 use signature::Signer;
 use std::time::Duration;
-use wintrust::portable::{
-    revocation::{self, RevocationLimits, RevocationStatus},
-    signed,
-};
+use support::{extension, sign_certificate};
+use wintrust::portable::revocation::{self, RevocationLimits, RevocationStatus};
 use x509_cert::{
     Certificate,
     crl::{CertificateList, RevokedCert, TbsCertList},
@@ -40,50 +41,15 @@ const ALL: u16 = 0x1fe;
 fn oid(s: &str) -> ObjectIdentifier {
     s.parse().unwrap()
 }
-fn extension(id: &str, bytes: Vec<u8>, critical: bool) -> Extension {
-    Extension {
-        extn_id: oid(id),
-        critical,
-        extn_value: OctetString::new(bytes).unwrap(),
-    }
-}
-fn key() -> SigningKey {
-    SigningKey::from_bytes((&[7; 32]).into()).unwrap()
-}
-fn prepare(mut cert: Certificate) -> Certificate {
-    let public = key().verifying_key().to_public_key_der().unwrap();
-    cert.tbs_certificate.subject_public_key_info =
-        x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(public.as_bytes()).unwrap();
-    cert.tbs_certificate.signature.oid = oid("1.2.840.10045.4.3.2");
-    cert.tbs_certificate.signature.parameters = None;
-    cert.signature_algorithm = cert.tbs_certificate.signature.clone();
-    cert.tbs_certificate
-        .extensions
-        .as_mut()
-        .unwrap()
-        .retain(|e| {
-            !matches!(
-                e.extn_id.to_string().as_str(),
-                "2.5.29.35" | "2.5.29.14" | "2.5.29.17" | "2.5.29.31" | "2.5.29.46"
-            )
-        });
-    cert
-}
-fn sign_certificate(mut cert: Certificate) -> Certificate {
-    let signature: Signature = key().sign(&cert.tbs_certificate.to_der().unwrap());
-    cert.signature = der::asn1::BitString::from_bytes(signature.to_der().as_bytes()).unwrap();
-    Certificate::from_der(&cert.to_der().unwrap()).unwrap()
-}
+
 fn templates() -> (Certificate, Certificate) {
-    let cms = signed::verify_signed_data(
-        include_bytes!("fixtures/catalog.cat"),
-        "1.3.6.1.4.1.311.10.1",
-    )
-    .unwrap();
-    (
-        prepare(Certificate::from_der(&cms.signers[0].certificate_der).unwrap()),
-        prepare(Certificate::from_der(include_bytes!("fixtures/root.der")).unwrap()),
-    )
+    support::templates(&[
+        "2.5.29.35",
+        "2.5.29.14",
+        "2.5.29.17",
+        "2.5.29.31",
+        "2.5.29.46",
+    ])
 }
 fn flags(bits: u16) -> FlagSet<Reasons> {
     FlagSet::<Reasons>::new_truncated(bits)
@@ -646,6 +612,7 @@ fn malformed_and_unauthenticated_crls_are_ignored_not_trusted() {
 
 #[test]
 #[ignore = "independent OpenSSL oracle; invoke explicitly in the development shell"]
+#[cfg(feature = "std")]
 fn openssl_agrees_on_crl_outcomes() {
     struct Case {
         name: &'static str,
@@ -1017,12 +984,12 @@ fn pinned_evidence_provenance_records_kind_location_and_digest() {
     delta.base = Some(1);
     let delta = delta.der();
     let ocsp = vec![1u8, 2, 3];
-    let provenance = revocation::pinned_provenance(
+    let provenance = revocation::pinned_provenance_labels(
         &[
-            (std::path::Path::new("evidence/base.crl"), base.as_slice()),
-            (std::path::Path::new("evidence/delta.crl"), delta.as_slice()),
+            ("evidence/base.crl", base.as_slice()),
+            ("evidence/delta.crl", delta.as_slice()),
         ],
-        &[(std::path::Path::new("evidence/leaf.ocsp"), ocsp.as_slice())],
+        &[("evidence/leaf.ocsp", ocsp.as_slice())],
     )
     .unwrap();
     let kinds = provenance.iter().map(|a| a.kind).collect::<Vec<_>>();

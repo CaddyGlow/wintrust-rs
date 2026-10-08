@@ -1,7 +1,12 @@
 //! Bounded inspection of Microsoft PKCS#7 catalog CTLs. Parsing establishes no trust.
-use der::{Decode, Reader, SliceReader, asn1::AnyRef};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::fmt;
+use der::{Decode, asn1::AnyRef};
 use serde::Serialize;
-use std::fmt;
 
 const SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
 const CTL: &str = "1.3.6.1.4.1.311.10.1";
@@ -39,7 +44,7 @@ impl fmt::Display for CatalogError {
         }
     }
 }
-impl std::error::Error for CatalogError {}
+impl core::error::Error for CatalogError {}
 impl From<der::Error> for CatalogError {
     fn from(e: der::Error) -> Self {
         Self::Malformed(e.to_string())
@@ -94,52 +99,9 @@ pub struct IndirectData {
     pub digest_hex: String,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct Node<'a> {
-    pub(crate) tag: u8,
-    pub(crate) full: &'a [u8],
-    pub(crate) value: &'a [u8],
-}
+pub(crate) use crate::der::{Node, children, field, node, oid, preflight, tagged};
 pub(crate) fn bad(message: &str) -> CatalogError {
     CatalogError::Malformed(message.into())
-}
-pub(crate) fn node(bytes: &[u8]) -> Result<(Node<'_>, usize), CatalogError> {
-    let mut r = SliceReader::new(bytes)?;
-    let a = AnyRef::decode(&mut r)?;
-    let consumed = usize::try_from(r.position()).map_err(|_| bad("length overflow"))?;
-    Ok((
-        Node {
-            tag: bytes[0],
-            full: &bytes[..consumed],
-            value: a.value(),
-        },
-        consumed,
-    ))
-}
-pub(crate) fn children(n: Node<'_>) -> Result<Vec<Node<'_>>, CatalogError> {
-    let mut bytes = n.value;
-    let mut out = Vec::new();
-    while !bytes.is_empty() {
-        let (n, size) = node(bytes)?;
-        out.push(n);
-        bytes = &bytes[size..];
-    }
-    Ok(out)
-}
-pub(crate) fn tagged(n: Node<'_>, tag: u8) -> Result<Node<'_>, CatalogError> {
-    if n.tag != tag {
-        return Err(bad("unexpected ASN.1 tag"));
-    }
-    Ok(n)
-}
-pub(crate) fn field<'a>(items: &[Node<'a>], i: usize, tag: u8) -> Result<Node<'a>, CatalogError> {
-    tagged(*items.get(i).ok_or_else(|| bad("missing field"))?, tag)
-}
-pub(crate) fn oid(n: Node<'_>) -> Result<String, CatalogError> {
-    tagged(n, 6)?;
-    Ok(AnyRef::from_der(n.full)?
-        .decode_as::<der::asn1::ObjectIdentifier>()?
-        .to_string())
 }
 pub(crate) fn algorithm(n: Node<'_>) -> Result<String, CatalogError> {
     let fields = children(tagged(n, 0x30)?)?;
@@ -254,77 +216,38 @@ fn indirect(n: Node<'_>) -> Result<IndirectData, CatalogError> {
     })
 }
 fn ctl(n: Node<'_>, limits: CatalogLimits) -> Result<CertificateTrustList, CatalogError> {
-    let f = children(tagged(n, 0x30)?)?;
-    let mut pos = 0;
-    let version = if f.first().is_some_and(|n| n.tag == 2) {
-        pos += 1;
-        integer(f[0])?
-    } else {
-        0
-    };
-    if version > 1 {
-        return Err(CatalogError::Unsupported(format!("CTL version {version}")));
-    }
-    let subject_usage = children(field(&f, pos, 0x30)?)?
-        .into_iter()
-        .map(oid)
-        .collect::<Result<Vec<_>, _>>()?;
-    pos += 1;
-    let list_identifier_hex = if f.get(pos).is_some_and(|n| n.tag == 4) {
-        let s = hex::encode(f[pos].value);
-        pos += 1;
-        Some(s)
-    } else {
-        None
-    };
-    let sequence_number_hex = if f.get(pos).is_some_and(|n| n.tag == 2) {
-        let s = hex::encode(f[pos].value);
-        pos += 1;
-        Some(s)
-    } else {
-        None
-    };
-    let this_update = time(*f.get(pos).ok_or_else(|| bad("missing CTL time"))?)?;
-    pos += 1;
-    let next_update = if f.get(pos).is_some_and(|n| matches!(n.tag, 0x17 | 0x18)) {
-        let s = time(f[pos])?;
-        pos += 1;
-        Some(s)
-    } else {
-        None
-    };
-    let subject_algorithm = algorithm(field(&f, pos, 0x30)?)?;
-    pos += 1;
+    let metadata = crate::ctl::parse_node(n, limits)?;
     let mut members = Vec::new();
-    let mut identifiers = std::collections::HashMap::new();
-    if f.get(pos).is_some_and(|n| n.tag == 0x30) {
-        let entries = children(f[pos])?;
-        pos += 1;
-        if entries.len() > limits.max_members {
-            return Err(CatalogError::Limit("members"));
-        }
-        for member in entries {
+    let mut identifiers = alloc::collections::BTreeMap::new();
+    {
+        for entry in &metadata.entries {
+            let (member, _) = node(entry.encoded)?;
             let m = children(tagged(member, 0x30)?)?;
             if m.len() != 2 {
                 return Err(bad("invalid CTL member"));
             }
-            let identifier_hex = hex::encode(tagged(m[0], 4)?.value);
-            let attrs = attributes(tagged(m[1], 0x31)?)?;
-            let raw = children(m[1])?;
+            let identifier_hex = hex::encode(entry.subject_identifier);
+            let attrs = entry
+                .attributes
+                .iter()
+                .map(|attr| Attribute {
+                    oid: attr.oid.to_string(),
+                    values_der_hex: attr.values.iter().map(hex::encode).collect(),
+                })
+                .collect();
             let mut indirect_data = None;
             let mut indirect_der = None;
-            for attr in raw {
-                let a = children(attr)?;
-                if oid(a[0])? == INDIRECT {
+            for attr in &entry.attributes {
+                if attr.oid.to_string() == INDIRECT {
                     if indirect_data.is_some() {
                         return Err(bad("duplicate indirect data"));
                     }
-                    let vals = children(a[1])?;
-                    if vals.len() != 1 {
+                    if attr.values.len() != 1 {
                         return Err(bad("multiple indirect data values"));
                     }
-                    indirect_data = Some(indirect(vals[0])?);
-                    indirect_der = Some(vals[0].full);
+                    let (value, _) = node(attr.values[0])?;
+                    indirect_data = Some(indirect(value)?);
+                    indirect_der = Some(value.full);
                 }
             }
             // A catalog can bind identical content to several authenticated Hint
@@ -362,61 +285,22 @@ fn ctl(n: Node<'_>, limits: CatalogLimits) -> Result<CertificateTrustList, Catal
             });
         }
     }
-    let extensions_der_hex = if f.get(pos).is_some_and(|n| n.tag == 0xa0) {
-        let s = hex::encode(f[pos].full);
-        pos += 1;
-        Some(s)
-    } else {
-        None
-    };
-    if pos != f.len() {
-        return Err(bad("unexpected CTL fields"));
-    }
     Ok(CertificateTrustList {
-        version,
-        subject_usage,
-        list_identifier_hex,
-        sequence_number_hex,
-        this_update,
-        next_update,
-        subject_algorithm,
+        version: metadata.version,
+        subject_usage: metadata
+            .subject_usage
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        list_identifier_hex: metadata.list_identifier.map(hex::encode),
+        sequence_number_hex: metadata.sequence_number.map(hex::encode),
+        this_update: metadata.this_update,
+        next_update: metadata.next_update,
+        subject_algorithm: metadata.subject_algorithm.to_string(),
         members,
-        extensions_der_hex,
+        extensions_der_hex: metadata.extensions.map(hex::encode),
         encoded_hex: hex::encode(n.full),
     })
-}
-pub(crate) fn preflight(
-    root: Node<'_>,
-    limits: CatalogLimits,
-    count: &mut usize,
-) -> Result<(), CatalogError> {
-    let mut stack = vec![(root, 0)];
-    while let Some((n, depth)) = stack.pop() {
-        *count += 1;
-        if *count > limits.max_nodes {
-            return Err(CatalogError::Limit("nodes"));
-        }
-        if depth > limits.max_depth {
-            return Err(CatalogError::Limit("depth"));
-        }
-        if n.tag & 0x20 != 0 {
-            let mut rest = n.value;
-            let mut previous: Option<&[u8]> = None;
-            while !rest.is_empty() {
-                let (child, size) = node(rest)?;
-                if n.tag == 0x31 && previous.is_some_and(|p| p > child.full) {
-                    return Err(bad("noncanonical SET OF order"));
-                }
-                previous = Some(child.full);
-                stack.push((child, depth + 1));
-                rest = &rest[size..];
-                if stack.len() > limits.max_nodes {
-                    return Err(CatalogError::Limit("nodes"));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 /// Inspect a strict DER catalog, retaining unknown attribute OIDs without assigning trust.
 pub fn parse(bytes: &[u8], limits: CatalogLimits) -> Result<Catalog, CatalogError> {
@@ -505,7 +389,7 @@ pub fn parse(bytes: &[u8], limits: CatalogLimits) -> Result<Catalog, CatalogErro
 /// PE and other SIP-specific formats are deliberately excluded.
 pub fn match_flat_xml_member(catalog: &Catalog, bytes: &[u8]) -> Result<Vec<usize>, CatalogError> {
     use sha2::Digest;
-    let text = std::str::from_utf8(bytes)
+    let text = core::str::from_utf8(bytes)
         .map_err(|_| CatalogError::Unsupported("flat member must be UTF-8 XML".into()))?;
     let xml = roxmltree::Document::parse(text)
         .map_err(|_| CatalogError::Unsupported("flat member must be XML".into()))?;
