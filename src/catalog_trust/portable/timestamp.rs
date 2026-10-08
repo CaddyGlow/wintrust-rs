@@ -12,6 +12,8 @@ const TST_INFO: &str = "1.2.840.113549.1.9.16.1.4";
 const TSA_EKU: &str = "1.3.6.1.5.5.7.3.8";
 const SIGNING_TIME: &str = "1.2.840.113549.1.9.5";
 
+type TimestampPathPolicy<'a> = dyn FnMut(&chain::ChainReport, u64) -> Result<()> + 'a;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TimestampReport {
     pub format: String,
@@ -173,8 +175,34 @@ fn verify_rfc3161_with_compatibility(
     allow_sha1: bool,
     noncritical_tsa_pins: &[String],
 ) -> Result<TimestampReport> {
+    verify_rfc3161_with_path_policy(
+        token,
+        original_signature,
+        roots,
+        now,
+        allow_sha1,
+        noncritical_tsa_pins,
+        &[],
+        chain::PathLimits::default(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_rfc3161_with_path_policy(
+    token: &[u8],
+    original_signature: &[u8],
+    roots: &[Vec<u8>],
+    now: u64,
+    allow_sha1: bool,
+    noncritical_tsa_pins: &[String],
+    issuer_candidates: &[Vec<u8>],
+    limits: chain::PathLimits,
+    accept_path: Option<&mut TimestampPathPolicy<'_>>,
+) -> Result<TimestampReport> {
     ensure!(token.len() <= 4 * 1024 * 1024, "timestamp byte limit");
-    let cms = signed::verify_signed_data_with_policy(token, TST_INFO, allow_sha1)?;
+    let mut cms = signed::verify_signed_data_with_policy(token, TST_INFO, allow_sha1)?;
+    cms.certificates.extend_from_slice(issuer_candidates);
     ensure!(cms.signers.len() == 1, "timestamp requires one signer");
     let (tst, size) = node(&cms.content_value)?;
     ensure!(
@@ -300,8 +328,28 @@ fn verify_rfc3161_with_compatibility(
             )
         }
     };
-    let start_path = validate_chain(start)?;
-    let path = validate_chain(end)?;
+    let (start_path, path) = if let Some(accept_path) = accept_path {
+        ensure!(
+            !compatibility_used,
+            "callback timestamp policy requires strict TSA certificates"
+        );
+        let path = chain::validate_with_path_policy(
+            &signer.certificate_der,
+            &cms.certificates,
+            roots,
+            end,
+            TSA_EKU,
+            allow_sha1,
+            limits,
+            |path| {
+                chain::validate_report_constraints(path, start, TSA_EKU)?;
+                accept_path(path, unix_time)
+            },
+        )?;
+        (path.clone(), path)
+    } else {
+        (validate_chain(start)?, validate_chain(end)?)
+    };
     if compatibility_used {
         ensure!(
             super::MICROSOFT_ROOTS.contains(&start_path.anchor_sha256.as_str())
@@ -348,6 +396,29 @@ pub fn verify_legacy_with_policy(
     now: u64,
     allow_sha1: bool,
 ) -> Result<TimestampReport> {
+    verify_legacy_with_path_policy(
+        counter,
+        original_signature,
+        certificates,
+        roots,
+        now,
+        allow_sha1,
+        chain::PathLimits::default(),
+        &mut |_, _| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_legacy_with_path_policy(
+    counter: &[u8],
+    original_signature: &[u8],
+    certificates: &[Vec<u8>],
+    roots: &[Vec<u8>],
+    now: u64,
+    allow_sha1: bool,
+    limits: chain::PathLimits,
+    accept_path: &mut TimestampPathPolicy<'_>,
+) -> Result<TimestampReport> {
     let signer = signed::verify_counter_signer_with_policy(
         counter,
         original_signature,
@@ -384,13 +455,15 @@ pub fn verify_legacy_with_policy(
         "missing, ambiguous or future countersignature time"
     );
     let unix_time = times[0];
-    let path = chain::validate_with_policy(
+    let path = chain::validate_with_path_policy(
         &signer.certificate_der,
         certificates,
         roots,
         unix_time,
         TSA_EKU,
         allow_sha1,
+        limits,
+        |path| accept_path(path, unix_time),
     )?;
     Ok(TimestampReport {
         format: "legacy_countersignature".into(),
@@ -436,30 +509,93 @@ pub(super) fn verify_timestamps_with_compatibility(
     allow_sha1: bool,
     noncritical_tsa_pins: &[String],
 ) -> Result<Option<TimestampReport>> {
+    verify_timestamps_inner(
+        signer,
+        certificates,
+        roots,
+        now,
+        allow_sha1,
+        noncritical_tsa_pins,
+        chain::PathLimits::default(),
+        None,
+    )
+}
+
+/// Verify timestamp binding and search TSA paths with a caller policy before
+/// selecting a path. The callback receives the authenticated timestamp time.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_timestamps_with_path_policy(
+    signer: &signed::VerifiedSigner,
+    certificates: &[Vec<u8>],
+    roots: &[Vec<u8>],
+    now: u64,
+    allow_sha1: bool,
+    limits: chain::PathLimits,
+    mut accept_path: impl FnMut(&chain::ChainReport, u64) -> Result<()>,
+) -> Result<Option<TimestampReport>> {
+    verify_timestamps_inner(
+        signer,
+        certificates,
+        roots,
+        now,
+        allow_sha1,
+        &[],
+        limits,
+        Some(&mut accept_path),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_timestamps_inner(
+    signer: &signed::VerifiedSigner,
+    certificates: &[Vec<u8>],
+    roots: &[Vec<u8>],
+    now: u64,
+    allow_sha1: bool,
+    noncritical_tsa_pins: &[String],
+    limits: chain::PathLimits,
+    mut accept_path: Option<&mut TimestampPathPolicy<'_>>,
+) -> Result<Option<TimestampReport>> {
     let mut timestamps = Vec::new();
     for (oid, values) in &signer.unsigned_attributes {
         if oid == RFC3161_ATTRIBUTE || oid == MICROSOFT_RFC3161_ATTRIBUTE {
             ensure!(values.len() == 1, "ambiguous RFC3161 timestamp values");
-            timestamps.push(verify_rfc3161_with_compatibility(
+            timestamps.push(verify_rfc3161_with_path_policy(
                 &values[0],
                 &signer.signature,
                 roots,
                 now,
                 allow_sha1,
                 noncritical_tsa_pins,
+                if accept_path.is_some() {
+                    certificates
+                } else {
+                    &[]
+                },
+                limits,
+                accept_path
+                    .as_mut()
+                    .map(|callback| &mut **callback as &mut TimestampPathPolicy<'_>),
             )?);
         } else if oid == COUNTERSIGNATURE_ATTRIBUTE {
             ensure!(
                 values.len() == 1,
                 "ambiguous legacy countersignature values"
             );
-            timestamps.push(verify_legacy_with_policy(
+            let mut noop = |_: &chain::ChainReport, _: u64| Ok(());
+            let callback = accept_path
+                .as_mut()
+                .map(|callback| &mut **callback as &mut TimestampPathPolicy<'_>)
+                .unwrap_or(&mut noop);
+            timestamps.push(verify_legacy_with_path_policy(
                 &values[0],
                 &signer.signature,
                 certificates,
                 roots,
                 now,
                 allow_sha1,
+                limits,
+                callback,
             )?);
         }
     }
@@ -558,8 +694,22 @@ mod tests {
 
     #[test]
     fn pinned_noncritical_tsa_still_rejects_mixed_or_duplicate_ekus() {
-        let original = include_bytes!("../../../tests/fixtures/microsoft-legacy-wcf/tsa.der");
-        let mut certificate = Certificate::from_der(original).unwrap();
+        let mut certificate =
+            Certificate::from_der(include_bytes!("../../../tests/fixtures/root.der")).unwrap();
+        let purposes = x509_cert::ext::pkix::ExtendedKeyUsage(vec![TSA_EKU.parse().unwrap()]);
+        let extensions = certificate.tbs_certificate.extensions.as_mut().unwrap();
+        extensions.retain(|e| e.extn_id.to_string() != "2.5.29.37");
+        extensions.push(x509_cert::ext::Extension {
+            extn_id: "2.5.29.37".parse().unwrap(),
+            critical: false,
+            extn_value: der::asn1::OctetString::new(purposes.to_der().unwrap()).unwrap(),
+        });
+        // This test checks the isolated EKU policy, not certificate signatures.
+        let original = certificate.to_der().unwrap();
+        let pin = hex::encode(crypto::digest("2.16.840.1.101.3.4.2.1", &original).unwrap());
+        assert!(require_tsa(&original, true, &[pin]).unwrap());
+        assert!(require_tsa(&original, true, &[]).is_err());
+        let mut certificate = Certificate::from_der(&original).unwrap();
         let extensions = certificate.tbs_certificate.extensions.as_mut().unwrap();
         let eku = extensions
             .iter_mut()
@@ -572,7 +722,7 @@ mod tests {
         let mixed = certificate.to_der().unwrap();
         let pin = hex::encode(crypto::digest("2.16.840.1.101.3.4.2.1", &mixed).unwrap());
         assert!(require_tsa(&mixed, true, &[pin]).is_err());
-        let mut certificate = Certificate::from_der(original).unwrap();
+        let mut certificate = Certificate::from_der(&original).unwrap();
         let extensions = certificate.tbs_certificate.extensions.as_mut().unwrap();
         let eku = extensions
             .iter()

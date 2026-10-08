@@ -4,6 +4,14 @@ use anyhow::{Context, Result, bail, ensure};
 use der::{Decode, Encode, Reader, SliceReader, asn1::AnyRef};
 use x509_cert::Certificate;
 
+/// Select embedded content or explicitly supply detached content.
+/// Detached mode requires eContent to be absent and never overrides embedded bytes.
+#[derive(Clone, Copy, Debug)]
+pub enum SignedDataContent<'a> {
+    Embedded,
+    Detached(&'a [u8]),
+}
+
 #[derive(Clone, Debug)]
 pub struct VerifiedSigner {
     pub certificate_der: Vec<u8>,
@@ -150,33 +158,43 @@ fn signer(
     let (certificate, cert) = &candidates[0];
     let digest_oid = alg(at(&f, 2, 0x30)?)?;
     let mut pos = 3;
-    let attrs_node = at(&f, pos, 0xa0)?;
-    pos += 1;
-    let signed_attributes = attributes(attrs_node)?;
-    let raw_digest = single(&signed_attributes, "1.2.840.113549.1.9.4")?;
-    let (digest_node, len) = node(raw_digest)?;
-    ensure!(
-        len == raw_digest.len() && digest_node.tag == 4,
-        "invalid messageDigest"
-    );
-    ensure!(
-        crypto::digest_with_policy(&digest_oid, content, allow_sha1)? == digest_node.value,
-        "signed content digest mismatch"
-    );
-    if let Some(expected) = content_type {
-        let raw = single(&signed_attributes, "1.2.840.113549.1.9.3")?;
-        let (n, len) = node(raw)?;
-        ensure!(
-            len == raw.len() && oid(n)? == expected,
-            "signed contentType mismatch"
-        );
+    let attrs_node = f.get(pos).copied().filter(|n| n.tag == 0xa0);
+    let signed_attributes = if let Some(attrs) = attrs_node {
+        pos += 1;
+        attributes(attrs)?
     } else {
         ensure!(
-            !signed_attributes
-                .iter()
-                .any(|(oid, _)| oid == "1.2.840.113549.1.9.3"),
-            "counter-signature must omit contentType"
+            content_type == Some("1.2.840.113549.1.7.1"),
+            "signed attributes required for non-data content"
         );
+        Vec::new()
+    };
+    if attrs_node.is_some() {
+        let raw_digest = single(&signed_attributes, "1.2.840.113549.1.9.4")?;
+        let (digest_node, len) = node(raw_digest)?;
+        ensure!(
+            len == raw_digest.len() && digest_node.tag == 4,
+            "invalid messageDigest"
+        );
+        ensure!(
+            crypto::digest_with_policy(&digest_oid, content, allow_sha1)? == digest_node.value,
+            "signed content digest mismatch"
+        );
+        if let Some(expected) = content_type {
+            let raw = single(&signed_attributes, "1.2.840.113549.1.9.3")?;
+            let (n, len) = node(raw)?;
+            ensure!(
+                len == raw.len() && oid(n)? == expected,
+                "signed contentType mismatch"
+            );
+        } else {
+            ensure!(
+                !signed_attributes
+                    .iter()
+                    .any(|(oid, _)| oid == "1.2.840.113549.1.9.3"),
+                "counter-signature must omit contentType"
+            );
+        }
     }
     let signature_algorithm = at(&f, pos, 0x30)?;
     pos += 1;
@@ -190,8 +208,13 @@ fn signer(
         Vec::new()
     };
     ensure!(pos == f.len(), "unexpected signer fields");
-    let mut signed_bytes = attrs_node.full.to_vec();
-    signed_bytes[0] = 0x31;
+    let signed_bytes = if let Some(attrs) = attrs_node {
+        let mut bytes = attrs.full.to_vec();
+        bytes[0] = 0x31;
+        bytes
+    } else {
+        content.to_vec()
+    };
     crypto::verify_algorithm(
         &cert.tbs_certificate.subject_public_key_info.to_der()?,
         signature_algorithm.full,
@@ -216,6 +239,23 @@ pub fn verify_signed_data_with_policy(
     expected_content_oid: &str,
     allow_sha1: bool,
 ) -> Result<VerifiedSignedData> {
+    verify_cms_signed_data(
+        bytes,
+        expected_content_oid,
+        SignedDataContent::Embedded,
+        allow_sha1,
+    )
+}
+
+/// Verify every CMS signer and exact content binding without assigning certificate trust.
+/// Resource limits are 32 MiB for each input, 64 certificates and 16 signers.
+/// Legacy PKCS#7 structured content retains its original content-value hashing.
+pub fn verify_cms_signed_data(
+    bytes: &[u8],
+    expected_content_oid: &str,
+    content: SignedDataContent<'_>,
+    allow_sha1: bool,
+) -> Result<VerifiedSignedData> {
     preflight(bytes)?;
     ensure!(bytes.len() <= 32 * 1024 * 1024, "SignedData byte limit");
     let (root, len) = node(bytes)?;
@@ -236,15 +276,34 @@ pub fn verify_signed_data_with_policy(
         .collect::<Result<Vec<_>>>()?;
     let info = fields(at(&sd, 2, 0x30)?, 0x30)?;
     ensure!(
-        info.len() == 2 && oid(info[0])? == expected_content_oid,
+        (1..=2).contains(&info.len()) && oid(info[0])? == expected_content_oid,
         "wrong encapsulated content type"
     );
-    let encap = fields(info[1], 0xa0)?;
-    ensure!(encap.len() == 1, "invalid content wrapper");
-    let (content_der, content_value) = if encap[0].tag == 4 {
-        (encap[0].value.to_vec(), encap[0].value.to_vec())
-    } else {
-        (encap[0].full.to_vec(), encap[0].value.to_vec())
+    let (content_der, content_value) = match content {
+        SignedDataContent::Detached(bytes) => {
+            ensure!(
+                info.len() == 1,
+                "detached mode requires absent embedded content"
+            );
+            ensure!(
+                bytes.len() <= 32 * 1024 * 1024,
+                "detached content byte limit"
+            );
+            (bytes.to_vec(), bytes.to_vec())
+        }
+        SignedDataContent::Embedded => {
+            ensure!(
+                info.len() == 2,
+                "detached content must be supplied explicitly"
+            );
+            let encap = fields(info[1], 0xa0)?;
+            ensure!(encap.len() == 1, "invalid content wrapper");
+            if encap[0].tag == 4 {
+                (encap[0].value.to_vec(), encap[0].value.to_vec())
+            } else {
+                (encap[0].full.to_vec(), encap[0].value.to_vec())
+            }
+        }
     };
     let mut pos = 3;
     let mut certificates = Vec::new();

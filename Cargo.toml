@@ -1,13 +1,36 @@
 [package]
 name = "wintrust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
 repository = "https://github.com/CaddyGlow/wintrust-rs"
 documentation = "https://docs.rs/wintrust"
 readme = "README.md"
-include = ["/src/**", "/tests/**", "/examples/**", "/docs/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+include = [
+  "/src/**",
+  "/examples/**",
+  "/docs/**",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/README.md",
+  "/CHANGELOG.md",
+  "/LICENSE",
+  "/tests/api.rs",
+  "/tests/chain_alternatives.rs",
+  "/tests/cms_detached.rs",
+  "/tests/ctl.rs",
+  "/tests/ctl_authentication.rs",
+  "/tests/runtime_verifier.rs",
+  "/tests/timestamp_issuer_candidates.rs",
+  "/tests/timestamp_path_policy.rs",
+  "/tests/fixtures/root.der",
+  "/tests/fixtures/catalog.cat",
+  "/tests/fixtures/catalog-member.mum",
+  "/tests/fixtures/good.crl.der",
+  "/tests/fixtures/catalog-good.ocsp.der",
+  "/tests/fixtures/policy.json",
+]
 keywords = ["authenticode", "catalog", "windows", "signature", "verification"]
 categories = ["cryptography", "authentication"]
 description = "Portable Rust catalog trust with Windows API name aliases"
@@ -15,9 +38,10 @@ description = "Portable Rust catalog trust with Windows API name aliases"
 [features]
 default = []
 native-reference = []
+online = ["dep:reqwest"]
 
 [dependencies]
-hexspell = { package = "caddy-hexspell", version = "1.1", default-features = false }
+hexspell = { package = "caddy-hexspell", version = "1.1.1", default-features = false }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -33,7 +57,10 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 signature = "2.2"
 roxmltree = "0.20"
 libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+  "blocking",
+  "rustls-tls-native-roots",
+] }
 
 [dev-dependencies]
 tempfile = "3.23"

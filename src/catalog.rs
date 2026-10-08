@@ -95,15 +95,15 @@ pub struct IndirectData {
 }
 
 #[derive(Clone, Copy)]
-struct Node<'a> {
-    tag: u8,
-    full: &'a [u8],
-    value: &'a [u8],
+pub(crate) struct Node<'a> {
+    pub(crate) tag: u8,
+    pub(crate) full: &'a [u8],
+    pub(crate) value: &'a [u8],
 }
-fn bad(message: &str) -> CatalogError {
+pub(crate) fn bad(message: &str) -> CatalogError {
     CatalogError::Malformed(message.into())
 }
-fn node(bytes: &[u8]) -> Result<(Node<'_>, usize), CatalogError> {
+pub(crate) fn node(bytes: &[u8]) -> Result<(Node<'_>, usize), CatalogError> {
     let mut r = SliceReader::new(bytes)?;
     let a = AnyRef::decode(&mut r)?;
     let consumed = usize::try_from(r.position()).map_err(|_| bad("length overflow"))?;
@@ -116,7 +116,7 @@ fn node(bytes: &[u8]) -> Result<(Node<'_>, usize), CatalogError> {
         consumed,
     ))
 }
-fn children(n: Node<'_>) -> Result<Vec<Node<'_>>, CatalogError> {
+pub(crate) fn children(n: Node<'_>) -> Result<Vec<Node<'_>>, CatalogError> {
     let mut bytes = n.value;
     let mut out = Vec::new();
     while !bytes.is_empty() {
@@ -126,33 +126,33 @@ fn children(n: Node<'_>) -> Result<Vec<Node<'_>>, CatalogError> {
     }
     Ok(out)
 }
-fn tagged(n: Node<'_>, tag: u8) -> Result<Node<'_>, CatalogError> {
+pub(crate) fn tagged(n: Node<'_>, tag: u8) -> Result<Node<'_>, CatalogError> {
     if n.tag != tag {
         return Err(bad("unexpected ASN.1 tag"));
     }
     Ok(n)
 }
-fn field<'a>(items: &[Node<'a>], i: usize, tag: u8) -> Result<Node<'a>, CatalogError> {
+pub(crate) fn field<'a>(items: &[Node<'a>], i: usize, tag: u8) -> Result<Node<'a>, CatalogError> {
     tagged(*items.get(i).ok_or_else(|| bad("missing field"))?, tag)
 }
-fn oid(n: Node<'_>) -> Result<String, CatalogError> {
+pub(crate) fn oid(n: Node<'_>) -> Result<String, CatalogError> {
     tagged(n, 6)?;
     Ok(AnyRef::from_der(n.full)?
         .decode_as::<der::asn1::ObjectIdentifier>()?
         .to_string())
 }
-fn algorithm(n: Node<'_>) -> Result<String, CatalogError> {
+pub(crate) fn algorithm(n: Node<'_>) -> Result<String, CatalogError> {
     let fields = children(tagged(n, 0x30)?)?;
     if fields.is_empty() || fields.len() > 2 {
         return Err(bad("invalid AlgorithmIdentifier"));
     }
     oid(fields[0])
 }
-fn integer(n: Node<'_>) -> Result<u64, CatalogError> {
+pub(crate) fn integer(n: Node<'_>) -> Result<u64, CatalogError> {
     tagged(n, 2)?;
     Ok(AnyRef::from_der(n.full)?.decode_as::<u64>()?)
 }
-fn time(n: Node<'_>) -> Result<String, CatalogError> {
+pub(crate) fn time(n: Node<'_>) -> Result<String, CatalogError> {
     match n.tag {
         0x17 => {
             AnyRef::from_der(n.full)?.decode_as::<der::asn1::UtcTime>()?;
@@ -164,7 +164,7 @@ fn time(n: Node<'_>) -> Result<String, CatalogError> {
     };
     String::from_utf8(n.value.to_vec()).map_err(|_| bad("invalid time encoding"))
 }
-fn attributes(n: Node<'_>) -> Result<Vec<Attribute>, CatalogError> {
+pub(crate) fn attributes(n: Node<'_>) -> Result<Vec<Attribute>, CatalogError> {
     children(n)?
         .into_iter()
         .map(|n| {
@@ -385,7 +385,11 @@ fn ctl(n: Node<'_>, limits: CatalogLimits) -> Result<CertificateTrustList, Catal
         encoded_hex: hex::encode(n.full),
     })
 }
-fn preflight(root: Node<'_>, limits: CatalogLimits, count: &mut usize) -> Result<(), CatalogError> {
+pub(crate) fn preflight(
+    root: Node<'_>,
+    limits: CatalogLimits,
+    count: &mut usize,
+) -> Result<(), CatalogError> {
     let mut stack = vec![(root, 0)];
     while let Some((n, depth)) = stack.pop() {
         *count += 1;

@@ -1,0 +1,101 @@
+{
+  "documentation": "https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/certificate-trust",
+  "retrieved_at": "2026-10-08T14:17:14.746858+00:00",
+  "max_bytes": 2097152,
+  "downloads": [
+    {
+      "url": "http://ctldl.windowsupdate.com/msdownload/update/v3/static/trustedr/en/authrootstl.cab",
+      "final_url": "http://ctldl.windowsupdate.com/msdownload/update/v3/static/trustedr/en/authrootstl.cab",
+      "headers": {
+        "Connection": "close",
+        "Content-Length": "80736",
+        "Cache-Control": "public,max-age=900",
+        "Content-Type": "application/vnd.ms-cab-compressed",
+        "Last-Modified": "Thu, 27 Aug 2026 19:41:42 GMT",
+        "ETag": "\"756128165c36dd1:0\"",
+        "Accept-Ranges": "bytes",
+        "Date": "Thu, 08 Oct 2026 14:17:14 GMT",
+        "Via": "1.1 varnish",
+        "Age": "497",
+        "X-Served-By": "cache-mrs1530037-MRS",
+        "X-Cache": "HIT",
+        "X-Cache-Hits": "18219",
+        "X-Timer": "S1791469035.782965,VS0,VE0",
+        "X-CID": "3",
+        "X-CCC": "FR"
+      },
+      "size": 80736,
+      "sha256": "778412b81d2d1b42a8394bd7920506224afb565e1159933f7366fed1fcc7891c"
+    },
+    {
+      "url": "http://ctldl.windowsupdate.com/msdownload/update/v3/static/trustedr/en/disallowedcertstl.cab",
+      "final_url": "http://ctldl.windowsupdate.com/msdownload/update/v3/static/trustedr/en/disallowedcertstl.cab",
+      "headers": {
+        "Connection": "close",
+        "Content-Length": "4987",
+        "Cache-Control": "public,max-age=900",
+        "Content-Type": "application/vnd.ms-cab-compressed",
+        "Last-Modified": "Fri, 05 Sep 2025 17:00:56 GMT",
+        "ETag": "\"77413ba5861edc1:0\"",
+        "Accept-Ranges": "bytes",
+        "Date": "Thu, 08 Oct 2026 14:17:14 GMT",
+        "Via": "1.1 varnish",
+        "Age": "471",
+        "X-Served-By": "cache-mrs1530043-MRS",
+        "X-Cache": "HIT",
+        "X-Cache-Hits": "18579",
+        "X-Timer": "S1791469035.792303,VS0,VE0",
+        "X-CID": "3",
+        "X-CCC": "FR"
+      },
+      "size": 4987,
+      "sha256": "0300e9ddb527990e8b59d06e9ccf3ec2bd92d3bbd0ef4fba69d6336e4195e82d"
+    }
+  ],
+  "extractor": {
+    "crate": "ms-cabinet",
+    "version": "0.1.2",
+    "cab_max_bytes": 2097152,
+    "max_members": 16,
+    "decompressed_max_bytes": 4194304,
+    "path_policy": "archive names remain metadata; fixed destination filenames"
+  },
+  "ctl_files": {
+    "disallowedcert.stl": {
+      "size": 6096,
+      "sha256": "400800c461437e5e304ec4a597acc79436e522afd0acb7e32cc01ff26d3133dc"
+    },
+    "authroot.stl": {
+      "size": 206702,
+      "sha256": "107fb03b1be6653c3e9803014622e2ae65e8df7bbf2d919d3f8bae2496005d51"
+    }
+  },
+  "independent_bootstrap": {
+    "url": "https://www.microsoft.com/pki/certs/MicRooCerAut_2010-06-23.crt",
+    "reference": "https://www.microsoft.com/pkiops/docs/repository.htm",
+    "retrieved_at": "2026-10-08T14:19:54.939386+00:00",
+    "sha1_pin_published_by_microsoft": "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+    "sha256": "df545bf919a2439c36983b54cdfc903dfa4f37d3996d8d84b4c31eec6f3c163e",
+    "size": 1521,
+    "headers": {
+      "Content-Length": "1521",
+      "Content-Type": "application/octet-stream",
+      "Content-MD5": "oma7fcw4pWJjE2G79h3RGw==",
+      "Last-Modified": "Thu, 02 Aug 2018 21:11:46 GMT",
+      "ETag": "0x8D5F8BC8E631BB8",
+      "x-ms-request-id": "34c8c6a4-701e-003d-5cc2-24c80e000000",
+      "x-ms-version": "2009-09-19",
+      "x-ms-lease-status": "unlocked",
+      "x-ms-blob-type": "BlockBlob",
+      "Date": "Thu, 08 Oct 2026 14:19:54 GMT",
+      "Connection": "close",
+      "TLS_version": "tls1.3",
+      "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+      "ms-cv": "CASMicrosoftCV8485f133.0",
+      "ms-cv-esi": "CASMicrosoftCV8485f133.0",
+      "X-EdgeScape-Location": "country_code=FR",
+      "X-RTag": "OneRoute_Default"
+    },
+    "scope": "explicit CTL audit bootstrap anchor only; no system trust installation"
+  }
+}

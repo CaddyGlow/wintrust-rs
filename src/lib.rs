@@ -21,6 +21,7 @@
 mod api;
 pub mod catalog;
 pub mod catalog_trust;
+pub mod ctl;
 
 pub use api::{
     CatalogAdminContext, crypt_cat_admin_acquire_context2,

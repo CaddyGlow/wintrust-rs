@@ -4,6 +4,8 @@
 pub mod chain;
 pub mod crypto;
 pub mod revocation;
+mod runtime;
+pub use runtime::{ValidatedVerifier, VerifierBuilder};
 pub mod signed;
 pub mod sip;
 pub mod timestamp;
@@ -112,6 +114,8 @@ impl Default for PortableLimits {
     }
 }
 
+/// Legacy mutable verifier retained for source compatibility.
+/// Prefer [`ValidatedVerifier`] for immutable, validated runtime configuration.
 /// Loaded pinned inputs; construction validates all fingerprints and limits.
 #[derive(Debug)]
 pub struct PortableVerifier {
@@ -175,6 +179,10 @@ impl PortableVerifier {
         limits: PortableLimits,
         mut reader: impl FnMut(&Path, usize) -> Result<Vec<u8>>,
     ) -> Result<Self> {
+        ensure!(
+            policy.revocation != PortableRevocationPolicy::Online || cfg!(feature = "online"),
+            "online policy requires the wintrust online feature"
+        );
         ensure!(
             policy.schema_version == 1,
             "unsupported portable trust policy version"
@@ -401,60 +409,56 @@ impl PortableVerifier {
                 "portable policy requires an authenticated timestamp"
             );
             let signature_time = timestamp.as_ref().map_or(now, |stamp| stamp.unix_time);
-            let path = chain::validate_with_policy(
+            let mut revocation = None;
+            let path = chain::validate_with_path_policy(
                 &signer.certificate_der,
                 &certificates,
                 &self.roots,
                 signature_time,
                 CODE_SIGNING_EKU,
                 self.policy.allow_sha1,
+                chain::PathLimits::default(),
+                |candidate| {
+                    if self.policy.publisher == PublisherPolicy::MicrosoftWindows {
+                        ensure!(
+                            MICROSOFT_ROOTS.contains(&candidate.anchor_sha256.as_str()),
+                            "signer does not chain to an authorized Microsoft root"
+                        );
+                        chain::validate_report_constraints(
+                            candidate,
+                            signature_time,
+                            WINDOWS_COMPONENT_EKU,
+                        )
+                        .context("Windows component publisher EKU policy")?;
+                    }
+                    if let Some(stamp) = &timestamp {
+                        for bound in [
+                            stamp
+                                .unix_time
+                                .checked_sub(stamp.accuracy_seconds)
+                                .context("timestamp accuracy underflow")?,
+                            stamp
+                                .unix_time
+                                .checked_add(stamp.accuracy_seconds)
+                                .context("timestamp accuracy overflow")?,
+                        ] {
+                            chain::validate_report_constraints(candidate, bound, CODE_SIGNING_EKU)?;
+                        }
+                    }
+                    revocation =
+                        self.check_revocation(&candidate.chain_der, signature_time, now, started)?;
+                    Ok(())
+                },
             )
             .context("catalog signer chain verification")?;
-            if self.policy.publisher == PublisherPolicy::MicrosoftWindows {
+            if self.policy.publisher == PublisherPolicy::MicrosoftWindows
+                && let Some(stamp) = &timestamp
+            {
                 ensure!(
-                    MICROSOFT_ROOTS.contains(&path.anchor_sha256.as_str()),
-                    "signer does not chain to an authorized Microsoft root"
+                    MICROSOFT_ROOTS.contains(&stamp.tsa_anchor_sha256.as_str()),
+                    "timestamp does not chain to an authorized Microsoft root"
                 );
-                chain::validate_with_policy(
-                    &signer.certificate_der,
-                    &certificates,
-                    &self.roots,
-                    signature_time,
-                    WINDOWS_COMPONENT_EKU,
-                    self.policy.allow_sha1,
-                )
-                .context("Windows component publisher EKU policy")?;
-                if let Some(stamp) = &timestamp {
-                    ensure!(
-                        MICROSOFT_ROOTS.contains(&stamp.tsa_anchor_sha256.as_str()),
-                        "timestamp does not chain to an authorized Microsoft root"
-                    );
-                }
             }
-            if let Some(stamp) = &timestamp {
-                // Timestamp precision/accuracy must not straddle a certificate expiry.
-                for bound in [
-                    stamp
-                        .unix_time
-                        .checked_sub(stamp.accuracy_seconds)
-                        .context("timestamp accuracy underflow")?,
-                    stamp
-                        .unix_time
-                        .checked_add(stamp.accuracy_seconds)
-                        .context("timestamp accuracy overflow")?,
-                ] {
-                    chain::validate_with_policy(
-                        &signer.certificate_der,
-                        &certificates,
-                        &self.roots,
-                        bound,
-                        CODE_SIGNING_EKU,
-                        self.policy.allow_sha1,
-                    )?;
-                }
-            }
-            let revocation =
-                self.check_revocation(&path.chain_der, signature_time, now, started)?;
             let timestamp_revocation = timestamp
                 .as_ref()
                 .map(|stamp| self.check_revocation(&stamp.chain_der, stamp.unix_time, now, started))

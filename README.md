@@ -4,7 +4,7 @@ Portable Rust catalog trust.
 
 ```toml
 [dependencies]
-wintrust = "0.1.0"
+wintrust = "0.1.1"
 ```
 
  The implementation includes CMS/CTL,
@@ -41,7 +41,21 @@ assert!(report.trust_established);
 
 The default implementation is Rust on all platforms. Feature `native-reference`
 enables the separate Windows oracle at `catalog_trust::verify_catalog_member`;
-it never changes `win_verify_trust` or its alias. Network TLS uses Rustls.
+it never changes `win_verify_trust` or its alias. The default dependency graph
+contains no HTTP client. Enable `online` explicitly for bounded CRL/OCSP
+acquisition using Rustls; online policies fail during loading without that feature.
+
+New callers should use `portable::ValidatedVerifier::load` or
+`portable::VerifierBuilder`. Runtime policy and pinned evidence have read-only
+accessors, configuration and certificate DER are validated during construction,
+and an omitted evaluation time is captured once when the verifier is built.
+`PortablePolicy` remains the versioned JSON input. The mutable `PortableVerifier`
+and Windows-name aliases remain available for source compatibility.
+
+`ctl::parse` inspects exact CTL bytes independently of catalog SIP member rules.
+It preserves borrowed entry identifiers and encodings, typed purpose/algorithm
+OIDs, sequence identifiers, update times, and unknown attributes. Parse results
+make no authentication or AuthRoot/Disallowed authorization claim.
 
 See [policy and limits](docs/portable-catalog-trust.md).
 Synthetic test fixtures originate from the independently signed fixture set in
@@ -50,6 +64,19 @@ private keys. The root and policy in `tests/fixtures` are for tests only.
 
 Windows naming references: [context acquisition](https://learn.microsoft.com/en-us/windows/win32/api/mscat/nf-mscat-cryptcatadminacquirecontext2)
 and [file hashing](https://learn.microsoft.com/en-us/windows/win32/api/mscat/nf-mscat-cryptcatadmincalchashfromfilehandle2).
+
+## Migration from 0.1
+
+CRL/OCSP acquisition is now optional. Applications using `PortableRevocationPolicy::Online`
+must enable `wintrust = { version = "0.1.1", features = ["online"] }`.
+Offline parsing and verification require no HTTP client. Existing function names,
+mutable-verifier compatibility APIs and Windows-name aliases remain available.
+New integrations should prefer the immutable runtime verifier.
+
+The published package includes synthetic test fixtures only. Microsoft-origin
+catalogs, manifests, certificates and cache-only CTL audit tests remain in the
+source repository, outside the registry archive. Run the repository suite for
+those interoperability regressions.
 
 ## Development
 

@@ -547,6 +547,7 @@ pub struct AcquiredRevocation {
 /// must already be authenticated to caller-supplied anchors. Redirects and URL
 /// credentials are refused; byte/request/wall-time limits apply. HTTP transport
 /// is permitted because acceptance depends on the signed issuer-bound artifact.
+#[cfg(feature = "online")]
 pub fn acquire_chain_revocation(
     path_der: &[Vec<u8>],
     now: u64,
@@ -710,6 +711,7 @@ pub fn acquire_chain_revocation(
     }
     Ok(output)
 }
+#[cfg(feature = "online")]
 fn ocsp_request(certificate: &Certificate, issuer: &Certificate) -> Result<Vec<u8>> {
     use der::asn1::{Null, ObjectIdentifier, OctetString};
     let hash_oid = "1.3.14.3.2.26";
@@ -748,4 +750,15 @@ fn ocsp_request(certificate: &Certificate, issuer: &Certificate) -> Result<Vec<u
         optional_signature: None,
     };
     Ok(request.to_der()?)
+}
+
+/// Acquisition is unavailable unless the explicit `online` capability is enabled.
+#[cfg(not(feature = "online"))]
+pub fn acquire_chain_revocation(
+    _path_der: &[Vec<u8>],
+    _now: u64,
+    _limits: RevocationLimits,
+    _online: OnlineLimits,
+) -> Result<AcquiredRevocation> {
+    anyhow::bail!("online revocation acquisition requires the wintrust online feature")
 }
