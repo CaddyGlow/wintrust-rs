@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "roots": [
+    {
+      "path": "microsoft-root-2010.der",
+      "sha256": "df545bf919a2439c36983b54cdfc903dfa4f37d3996d8d84b4c31eec6f3c163e"
+    },
+    {
+      "path": "microsoft-root-2011.der",
+      "sha256": "847df6a78497943f27fc72eb93f9a637320a02b561d0a91b09e87a7807ed7c61"
+    },
+    {
+      "path": "microsoft-rsa-root-2017.der",
+      "sha256": "c741f70f4b2a8d88bf2e71c14122ef53ef10eba0cfa5e64cfa20f418853073e0"
+    }
+  ],
+  "intermediates": [],
+  "crls": [],
+  "ocsp_responses": [],
+  "publisher": "microsoft_windows",
+  "revocation": "disabled",
+  "timestamp": "require",
+  "verification_time": 1791172361,
+  "allow_sha1": false,
+  "revocation_max_age_seconds": 604800,
+  "noncritical_tsa_certificate_sha256": [
+    "02be0cc3429f777c870bae6ce909ed880a4245ed711b525edd7246e965ef9a93",
+    "4540cd42e1fe2822157edfb1a7b6424f00f4a9020554a6780fe7c948f2b3c2e2",
+    "643eed951273816d017198b9a91f52de08e1bebb755fb993ce80264e8eeb0c8c",
+    "733be458c3df713a51e5bda79f3ca137712dcd25d594f1fa22041c0f8dd65f47",
+    "a208d14576bcfeaeaa7c5b12e335c0d5e4d4b09c46712f960ba93b92348ada94",
+    "a76393c1e699d1354eb556e2cb067f9743f06a3aa850e0fa844b78d359044845",
+    "e0916df1a2c47166536c94aff4d37cad6aa79529f903ed8df41c368a692bdb77"
+  ]
+}

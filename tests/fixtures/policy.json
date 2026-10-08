@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "roots": [
+    {
+      "path": "root.der",
+      "sha256": "04560ee209485ee7933bb9d1c420d4cec2d1551503bef62dbf0acf7fb2f70930"
+    }
+  ],
+  "crls": [
+    {
+      "path": "good.crl.der",
+      "sha256": "72eeb742210ee5c498ab7ec0ce5158c7e705b9be265347dbf3b59aec99c1b1e4"
+    }
+  ],
+  "ocsp_responses": [
+    {
+      "path": "catalog-good.ocsp.der",
+      "sha256": "bf6260b8c2b44696982a5b3f2b4b45eba95fbad044c8c4bb40150f56588b9b80"
+    }
+  ],
+  "publisher": "explicit_roots",
+  "revocation": "require_fresh",
+  "timestamp": "require",
+  "verification_time": 1791117219
+}

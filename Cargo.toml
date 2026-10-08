@@ -1,0 +1,44 @@
+[package]
+name = "wintrust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/CaddyGlow/wintrust-rs"
+documentation = "https://docs.rs/wintrust"
+readme = "README.md"
+keywords = ["authenticode", "catalog", "windows", "signature", "verification"]
+categories = ["cryptography", "authentication"]
+description = "Portable Rust catalog trust with Windows API name aliases"
+
+[features]
+default = []
+native-reference = []
+
+[dependencies]
+hexspell = { package = "caddy-hexspell", version = "1.1", default-features = false }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+hex = "0.4"
+der = { version = "0.7", features = ["alloc", "oid"] }
+x509-cert = "0.2.5"
+x509-ocsp = "0.2"
+rsa = { version = "0.9", features = ["sha2"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+signature = "2.2"
+roxmltree = "0.20"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+chunks_exact_to_as_chunks = "allow"
