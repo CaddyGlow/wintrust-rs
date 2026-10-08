@@ -5,10 +5,11 @@ use der::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use x509_cert::{
     Certificate,
-    crl::CertificateList,
     ext::pkix::{ExtendedKeyUsage, KeyUsage},
 };
 use x509_ocsp::{BasicOcspResponse, CertStatus, OcspResponse, OcspResponseStatus, ResponderId};
+
+mod crl;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +31,8 @@ pub struct RevocationReport {
     pub certificates: Vec<CertificateStatus>,
     pub current_unix_time: u64,
     pub signature_verification_time: u64,
+    /// Origin of artifacts acquired online for this report; empty for supplied evidence.
+    pub provenance: Vec<ArtifactProvenance>,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct RevocationLimits {
@@ -102,8 +105,12 @@ fn extensions_supported(
     }
     Ok(())
 }
-/// Verify a complete direct CRL issued by this exact certificate issuer.
-/// Delta/indirect/partitioned CRLs fail closed; they cannot prove absence here.
+/// Verify a CRL for `certificate` issued by `issuer` (RFC 5280 section 6.3).
+///
+/// Status is `Good` only when this single CRL is fresh, authenticated, in scope
+/// and covers every revocation reason; a listing is `Revoked`. A delta CRL, a
+/// partial-scope CRL or stale evidence cannot prove absence here and is an
+/// error; use [`verify_chain_revocation_with_signers`] to combine several CRLs.
 pub fn verify_crl(
     bytes: &[u8],
     certificate: &Certificate,
@@ -111,110 +118,17 @@ pub fn verify_crl(
     now: u64,
     limits: RevocationLimits,
 ) -> Result<RevocationStatus> {
-    ensure!(bytes.len() <= limits.max_artifact_bytes, "CRL byte limit");
-    let crl = CertificateList::from_der(bytes)?;
-    let tbs = &crl.tbs_cert_list;
+    let outcome = crl::evaluate(&[bytes], certificate, issuer, &[], now, limits)?;
     ensure!(
-        certificate.tbs_certificate.issuer == issuer.tbs_certificate.subject
-            && tbs.issuer == issuer.tbs_certificate.subject,
-        "CRL issuer mismatch"
-    );
-    ensure!(
-        tbs.signature == crl.signature_algorithm,
-        "CRL signature algorithm mismatch"
-    );
-    let ku = issuer
-        .tbs_certificate
-        .get::<KeyUsage>()?
-        .context("CRL signer keyUsage missing")?;
-    ensure!(ku.1.crl_sign(), "issuer lacks cRLSign usage");
-    let exts = tbs.crl_extensions.as_deref();
-    extensions_supported(exts, &[])?;
-    for e in exts.unwrap_or_default() {
-        let id = e.extn_id.to_string();
-        ensure!(
-            id != "2.5.29.27" && id != "2.5.29.28" && id != "2.5.29.46",
-            "delta or scoped CRL unsupported"
-        );
-        if id == "2.5.29.35" {
-            let aki =
-                x509_cert::ext::pkix::AuthorityKeyIdentifier::from_der(e.extn_value.as_bytes())?;
-            ensure!(
-                aki.authority_cert_issuer.is_some() == aki.authority_cert_serial_number.is_some(),
-                "CRL authority issuer/serial must appear together"
-            );
-            if let Some(names) = &aki.authority_cert_issuer {
-                use x509_cert::ext::pkix::name::GeneralName;
-                ensure!(
-                    names.len() == 1
-                        && matches!(&names[0],GeneralName::DirectoryName(name) if *name==issuer.tbs_certificate.issuer),
-                    "CRL authority certificate issuer mismatch"
-                );
-            }
-            if let Some(key) = aki.key_identifier {
-                let ski = issuer
-                    .tbs_certificate
-                    .get::<x509_cert::ext::pkix::SubjectKeyIdentifier>()?
-                    .context("CRL AKI has no issuer SKI")?;
-                ensure!(key == ski.1.0, "CRL authority key mismatch");
-            }
-            if let Some(serial) = aki.authority_cert_serial_number {
-                ensure!(
-                    serial == issuer.tbs_certificate.serial_number,
-                    "CRL authority serial mismatch"
-                );
-            }
+        outcome.status != RevocationStatus::Unknown,
+        "CRL does not establish certificate status: {}",
+        if outcome.diagnostics.is_empty() {
+            "no fresh in-scope evidence".to_owned()
+        } else {
+            outcome.diagnostics.join("; ")
         }
-    }
-    let signature = crl
-        .signature
-        .as_bytes()
-        .context("unaligned CRL signature")?;
-    verify_signature(
-        issuer,
-        &crl.signature_algorithm.to_der()?,
-        &tbs.to_der()?,
-        signature,
-        limits.allow_sha1,
-    )?;
-    let entries = tbs.revoked_certificates.as_deref().unwrap_or_default();
-    ensure!(entries.len() <= limits.max_entries, "CRL entry limit");
-    let mut serials = std::collections::BTreeSet::new();
-    let mut revoked = false;
-    for entry in entries {
-        ensure!(
-            serials.insert(entry.serial_number.as_bytes().to_vec()),
-            "duplicate CRL serial"
-        );
-        extensions_supported(entry.crl_entry_extensions.as_deref(), &[])?;
-        ensure!(
-            !entry
-                .crl_entry_extensions
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|e| e.extn_id.to_string() == "2.5.29.29"),
-            "indirect CRL entry unsupported"
-        );
-        ensure!(
-            entry.revocation_date.to_unix_duration().as_secs() <= now,
-            "CRL revocation date is future"
-        );
-        if entry.serial_number == certificate.tbs_certificate.serial_number {
-            revoked = true;
-        }
-    }
-    // A signed revocation always dominates, including an otherwise stale CRL.
-    if revoked {
-        return Ok(RevocationStatus::Revoked);
-    }
-    fresh(
-        tbs.this_update.to_unix_duration().as_secs(),
-        tbs.next_update.map(|t| t.to_unix_duration().as_secs()),
-        now,
-        limits,
-    )?;
-    Ok(RevocationStatus::Good)
+    );
+    Ok(outcome.status)
 }
 fn responder_matches(id: &ResponderId, certificate: &Certificate) -> Result<bool> {
     Ok(match id {
@@ -451,6 +365,23 @@ pub fn verify_chain_revocation(
     now: u64,
     limits: RevocationLimits,
 ) -> Result<RevocationReport> {
+    verify_chain_revocation_with_signers(path_der, crls, ocsp, &[], verification_time, now, limits)
+}
+
+/// Like [`verify_chain_revocation`], additionally accepting candidate CRL
+/// signing certificates for indirect CRLs and CRL key rollover. Each candidate
+/// is authenticated per CRL: it must be the certificate issuer or directly
+/// issued by it, valid at `now`, and carry `cRLSign`. Direct, indirect, scoped
+/// and delta CRLs are evaluated together per certificate (RFC 5280 6.3).
+pub fn verify_chain_revocation_with_signers(
+    path_der: &[Vec<u8>],
+    crls: &[Vec<u8>],
+    ocsp: &[Vec<u8>],
+    crl_signers: &[Vec<u8>],
+    verification_time: u64,
+    now: u64,
+    limits: RevocationLimits,
+) -> Result<RevocationReport> {
     ensure!(
         !path_der.is_empty() && path_der.len() <= limits.max_chain_certificates,
         "revocation chain length limit"
@@ -459,10 +390,19 @@ pub fn verify_chain_revocation(
         crls.len() + ocsp.len() <= limits.max_artifacts,
         "revocation artifact count limit"
     );
+    ensure!(
+        crl_signers.len() <= limits.max_chain_certificates * 16,
+        "CRL signer candidate limit"
+    );
     let path = path_der
         .iter()
         .map(|b| Certificate::from_der(b))
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let signers = crl_signers
+        .iter()
+        .map(|b| Certificate::from_der(b))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let crl_refs = crls.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let mut certificates = Vec::new();
     for i in 0..path.len() - 1 {
         let mut report = CertificateStatus {
@@ -471,25 +411,28 @@ pub fn verify_chain_revocation(
             evidence_sha256: Vec::new(),
             diagnostics: Vec::new(),
         };
-        for (kind, artifacts) in [("CRL", crls), ("OCSP", ocsp)] {
-            for artifact in artifacts {
-                let result = if kind == "CRL" {
-                    verify_crl(artifact, &path[i], &path[i + 1], now, limits)
-                } else {
-                    verify_ocsp(artifact, &path[i], &path[i + 1], now, limits)
-                };
-                match result {
-                    Ok(status) => {
-                        report.evidence_sha256.push(hash(artifact)?);
-                        if status == RevocationStatus::Revoked
-                            || report.status != RevocationStatus::Revoked
-                                && status == RevocationStatus::Good
-                        {
-                            report.status = status;
-                        }
+        if !crls.is_empty() {
+            let outcome = crl::evaluate(&crl_refs, &path[i], &path[i + 1], &signers, now, limits)?;
+            for index in &outcome.used {
+                report.evidence_sha256.push(hash(&crls[*index])?);
+            }
+            report
+                .diagnostics
+                .extend(outcome.diagnostics.into_iter().map(|d| format!("CRL: {d}")));
+            report.status = outcome.status;
+        }
+        for artifact in ocsp {
+            match verify_ocsp(artifact, &path[i], &path[i + 1], now, limits) {
+                Ok(status) => {
+                    report.evidence_sha256.push(hash(artifact)?);
+                    if status == RevocationStatus::Revoked
+                        || report.status != RevocationStatus::Revoked
+                            && status == RevocationStatus::Good
+                    {
+                        report.status = status;
                     }
-                    Err(error) => report.diagnostics.push(format!("{kind}: {error}")),
                 }
+                Err(error) => report.diagnostics.push(format!("OCSP: {error}")),
             }
         }
         if report.evidence_sha256.is_empty() {
@@ -517,6 +460,7 @@ pub fn verify_chain_revocation(
         certificates,
         current_unix_time: now,
         signature_verification_time: verification_time,
+        provenance: Vec::new(),
     })
 }
 
@@ -537,11 +481,28 @@ impl Default for OnlineLimits {
         }
     }
 }
+/// Where and when one acquired artifact came from.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactProvenance {
+    /// `crl`, `delta-crl` or `ocsp`.
+    pub kind: &'static str,
+    pub url: String,
+    pub sha256: String,
+    pub bytes: usize,
+    /// Verification time at which the artifact was retrieved and authenticated.
+    pub retrieved_at: u64,
+    /// The certificate whose status the request concerned.
+    pub certificate_sha256: String,
+    /// `crl-distribution-point`, `freshest-crl` or `authority-info-access`.
+    pub source: &'static str,
+}
 #[derive(Debug, Default)]
 pub struct AcquiredRevocation {
     pub crls: Vec<Vec<u8>>,
     pub ocsp_responses: Vec<Vec<u8>>,
     pub diagnostics: Vec<String>,
+    /// One entry per accepted artifact, in the order of `crls` then `ocsp_responses`.
+    pub provenance: Vec<ArtifactProvenance>,
 }
 /// Retrieve status only when caller explicitly chose online policy. The chain
 /// must already be authenticated to caller-supplied anchors. Redirects and URL
@@ -554,11 +515,43 @@ pub fn acquire_chain_revocation(
     limits: RevocationLimits,
     online: OnlineLimits,
 ) -> Result<AcquiredRevocation> {
+    acquire_chain_revocation_with_signers(path_der, &[], now, limits, online)
+}
+
+/// Like [`acquire_chain_revocation`], with candidate CRL signing certificates
+/// so indirect CRLs can be authenticated. Delta CRLs are requested from the
+/// certificate's and each accepted CRL's `freshestCRL` locations.
+#[cfg(feature = "online")]
+pub fn acquire_chain_revocation_with_signers(
+    path_der: &[Vec<u8>],
+    crl_signers: &[Vec<u8>],
+    now: u64,
+    limits: RevocationLimits,
+    online: OnlineLimits,
+) -> Result<AcquiredRevocation> {
     use std::io::Read;
     use x509_cert::ext::pkix::{
-        AuthorityInfoAccessSyntax, CrlDistributionPoints,
+        AuthorityInfoAccessSyntax, CrlDistributionPoints, FreshestCrl,
         name::{DistributionPointName, GeneralName},
     };
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Kind {
+        Crl,
+        Ocsp,
+    }
+    fn uris(points: &[x509_cert::ext::pkix::crl::dp::DistributionPoint]) -> Vec<String> {
+        let mut out = Vec::new();
+        for point in points {
+            if let Some(DistributionPointName::FullName(names)) = &point.distribution_point {
+                for name in names {
+                    if let GeneralName::UniformResourceIdentifier(uri) = name {
+                        out.push(uri.as_str().to_owned());
+                    }
+                }
+            }
+        }
+        out
+    }
     ensure!(
         path_der.len() <= limits.max_chain_certificates,
         "online chain limit"
@@ -570,7 +563,15 @@ pub fn acquire_chain_revocation(
             && online.max_response_bytes <= limits.max_artifact_bytes,
         "invalid online limits"
     );
+    ensure!(
+        crl_signers.len() <= limits.max_chain_certificates * 16,
+        "CRL signer candidate limit"
+    );
     let path = path_der
+        .iter()
+        .map(|b| Certificate::from_der(b))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let signers = crl_signers
         .iter()
         .map(|b| Certificate::from_der(b))
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -584,24 +585,27 @@ pub fn acquire_chain_revocation(
     let mut count = 0usize;
     let mut total = 0usize;
     let mut attempted = std::collections::BTreeSet::new();
-    for pair in path.windows(2) {
+    for (position, pair) in path.windows(2).enumerate() {
         let cert = &pair[0];
         let issuer = &pair[1];
-        let mut requests = Vec::new();
+        let certificate_sha256 = hash(&path_der[position])?;
+        // (kind, url, source)
+        let mut requests: Vec<(Kind, String, &'static str)> = Vec::new();
         if let Some((_, points)) = cert.tbs_certificate.get::<CrlDistributionPoints>()? {
             ensure!(points.0.len() <= 64, "online distribution point limit");
-            for point in points.0 {
-                if point.reasons.is_some() || point.crl_issuer.is_some() {
-                    continue;
-                }
-                if let Some(DistributionPointName::FullName(names)) = point.distribution_point {
-                    for name in names {
-                        if let GeneralName::UniformResourceIdentifier(uri) = name {
-                            requests.push((false, uri.as_str().to_owned()));
-                        }
-                    }
-                }
-            }
+            requests.extend(
+                uris(&points.0)
+                    .into_iter()
+                    .map(|u| (Kind::Crl, u, "crl-distribution-point")),
+            );
+        }
+        if let Some((_, points)) = cert.tbs_certificate.get::<FreshestCrl>()? {
+            ensure!(points.0.len() <= 64, "online distribution point limit");
+            requests.extend(
+                uris(&points.0)
+                    .into_iter()
+                    .map(|u| (Kind::Crl, u, "freshest-crl")),
+            );
         }
         if let Some((_, access)) = cert.tbs_certificate.get::<AuthorityInfoAccessSyntax>()? {
             ensure!(access.0.len() <= 64, "online AIA limit");
@@ -609,13 +613,16 @@ pub fn acquire_chain_revocation(
                 if description.access_method.to_string() == "1.3.6.1.5.5.7.48.1"
                     && let GeneralName::UniformResourceIdentifier(uri) = description.access_location
                 {
-                    requests.push((true, uri.as_str().to_owned()));
+                    requests.push((Kind::Ocsp, uri.as_str().to_owned(), "authority-info-access"));
                 }
             }
         }
-        for (is_ocsp, url) in requests {
+        let mut cursor = 0;
+        while cursor < requests.len() {
+            let (kind, url, source) = requests[cursor].clone();
+            cursor += 1;
             if !attempted.insert((
-                is_ocsp,
+                kind,
                 url.clone(),
                 cert.tbs_certificate.serial_number.as_bytes().to_vec(),
             )) {
@@ -630,7 +637,8 @@ pub fn acquire_chain_revocation(
                     .push("online revocation request/time/total byte limit reached".into());
                 return Ok(output);
             }
-            let result = (|| -> Result<Vec<u8>> {
+            let is_ocsp = kind == Kind::Ocsp;
+            let result = (|| -> Result<(Vec<u8>, bool, Vec<String>)> {
                 ensure!(url.len() <= 8192, "revocation URL length limit");
                 let parsed = reqwest::Url::parse(&url)?;
                 ensure!(
@@ -682,24 +690,55 @@ pub fn acquire_chain_revocation(
                     total <= online.max_total_bytes,
                     "online response total byte limit"
                 );
-                let status = if is_ocsp {
-                    verify_ocsp(&bytes, cert, issuer, now, limits)?
-                } else {
-                    verify_crl(&bytes, cert, issuer, now, limits)?
-                };
+                if is_ocsp {
+                    ensure!(
+                        verify_ocsp(&bytes, cert, issuer, now, limits)?
+                            != RevocationStatus::Unknown,
+                        "online responder status unknown"
+                    );
+                    return Ok((bytes, false, Vec::new()));
+                }
+                // A CRL is accepted when authenticated and authorized for this
+                // certificate. Completeness and freshness are decided later, so
+                // delta and scoped CRLs are retained.
+                let outcome = crl::evaluate(&[&bytes], cert, issuer, &signers, now, limits)?;
                 ensure!(
-                    status != RevocationStatus::Unknown,
-                    "online responder status unknown"
+                    !outcome.relevant.is_empty(),
+                    "online CRL not authenticated for the certificate: {}",
+                    outcome.diagnostics.join("; ")
                 );
-                Ok(bytes)
+                let (is_delta, locations) = crl::locations(&bytes)?;
+                Ok((bytes, is_delta, locations))
             })();
             count += 1;
             match result {
-                Ok(bytes) => {
+                Ok((bytes, is_delta, locations)) => {
+                    output.provenance.push(ArtifactProvenance {
+                        kind: if is_ocsp {
+                            "ocsp"
+                        } else if is_delta {
+                            "delta-crl"
+                        } else {
+                            "crl"
+                        },
+                        url,
+                        sha256: hash(&bytes)?,
+                        bytes: bytes.len(),
+                        retrieved_at: now,
+                        certificate_sha256: certificate_sha256.clone(),
+                        source,
+                    });
                     if is_ocsp {
                         output.ocsp_responses.push(bytes)
                     } else {
-                        output.crls.push(bytes)
+                        output.crls.push(bytes);
+                        if requests.len() + locations.len() <= 256 {
+                            requests.extend(
+                                locations
+                                    .into_iter()
+                                    .map(|u| (Kind::Crl, u, "freshest-crl")),
+                            );
+                        }
                     }
                 }
                 Err(error) => output.diagnostics.push(format!(
@@ -756,6 +795,18 @@ fn ocsp_request(certificate: &Certificate, issuer: &Certificate) -> Result<Vec<u
 #[cfg(not(feature = "online"))]
 pub fn acquire_chain_revocation(
     _path_der: &[Vec<u8>],
+    _now: u64,
+    _limits: RevocationLimits,
+    _online: OnlineLimits,
+) -> Result<AcquiredRevocation> {
+    anyhow::bail!("online revocation acquisition requires the wintrust online feature")
+}
+
+/// Acquisition is unavailable unless the explicit `online` capability is enabled.
+#[cfg(not(feature = "online"))]
+pub fn acquire_chain_revocation_with_signers(
+    _path_der: &[Vec<u8>],
+    _crl_signers: &[Vec<u8>],
     _now: u64,
     _limits: RevocationLimits,
     _online: OnlineLimits,

@@ -19,6 +19,7 @@ include = [
   "/tests/api.rs",
   "/tests/chain_alternatives.rs",
   "/tests/cms_detached.rs",
+  "/tests/crl_evaluation.rs",
   "/tests/name_constraints.rs",
   "/tests/policy_processing.rs",
   "/tests/ctl.rs",

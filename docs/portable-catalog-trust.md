@@ -64,6 +64,24 @@ points; missing, stale or invalid evidence cannot establish good status.
 Authenticated revoked status dominates good evidence. Disabling revocation is
 reported explicitly and must be a deliberate policy choice.
 
+CRLs follow RFC 5280 6.3 as a set per certificate. Direct, indirect (authorized
+by the certificate's `cRLIssuer`, with `certificateIssuer` entries), scoped
+(`issuingDistributionPoint` name, user/CA-only and `onlySomeReasons` partitions)
+and delta CRLs (`deltaCRLIndicator`, newest delta wins, `removeFromCRL` releases
+only a `certificateHold`) are combined. Good status requires fresh in-scope
+evidence covering every reason; any authenticated listing is revoked. A CRL
+signer other than the certificate issuer must be directly issued by it, valid
+and `cRLSign`-capable; pinned intermediates serve as signer candidates. Longer
+CRL-signer paths, relative-to-full distribution point name conversion and
+attribute-certificate CRLs are treated as out of scope and never establish good
+status. Online acquisition also follows `freshestCRL` and records each
+artifact's URL, digest, size and source in the revocation report.
+
+Certificate policies follow RFC 5280 6.1 through `chain::PathOptions`: policy
+tree, mappings, `policyConstraints`, `inhibitAnyPolicy`, initial policy inputs
+and explicit partial-chain selection. The report retains valid policies,
+per-certificate diagnostics and rejected alternative paths.
+
 `timestamp` is `use_verified`, `require`, or `ignore`. RFC3161 and legacy
 countersignatures must authenticate the actual signer signature and TSA chain.
 Advertised invalid timestamps reject verification. Unauthenticated signing time

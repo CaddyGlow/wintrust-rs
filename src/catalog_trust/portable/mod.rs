@@ -515,6 +515,7 @@ impl PortableVerifier {
         let mut crls = self.crls.clone();
         let mut ocsp = self.ocsp_responses.clone();
         let mut diagnostics = Vec::new();
+        let mut provenance = Vec::new();
         if self.policy.revocation == PortableRevocationPolicy::Online {
             let remaining = self
                 .limits
@@ -522,8 +523,9 @@ impl PortableVerifier {
                 .checked_sub(started.elapsed().as_secs())
                 .filter(|seconds| *seconds > 0)
                 .context("portable online verification deadline exceeded")?;
-            let acquired = revocation::acquire_chain_revocation(
+            let acquired = revocation::acquire_chain_revocation_with_signers(
                 path,
+                &self.intermediates,
                 now,
                 limits,
                 revocation::OnlineLimits {
@@ -534,9 +536,18 @@ impl PortableVerifier {
             crls.extend(acquired.crls);
             ocsp.extend(acquired.ocsp_responses);
             diagnostics = acquired.diagnostics;
+            provenance = acquired.provenance;
         }
-        let mut report =
-            revocation::verify_chain_revocation(path, &crls, &ocsp, signature_time, now, limits)?;
+        let mut report = revocation::verify_chain_revocation_with_signers(
+            path,
+            &crls,
+            &ocsp,
+            &self.intermediates,
+            signature_time,
+            now,
+            limits,
+        )?;
+        report.provenance = provenance;
         if let Some(certificate) = report.certificates.first_mut() {
             certificate.diagnostics.extend(diagnostics);
         }
