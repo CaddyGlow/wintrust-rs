@@ -3,6 +3,7 @@
 //! This policy is reproducible without inheriting a host Windows trust store.
 pub mod chain;
 pub mod crypto;
+pub mod policy;
 pub mod revocation;
 mod runtime;
 pub use runtime::{ValidatedVerifier, VerifierBuilder};

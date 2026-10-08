@@ -5,6 +5,9 @@
 ### Added
 
 - RFC 5280 name-constraint processing in the shared path validator for DNS, mailbox, URI DNS-host, IP CIDR and ASCII directory-name forms, including alternative paths, issuer intersections and self-issued rollover. Unsupported international DN matching, non-DNS URI hosts, other constraint forms and distance semantics fail closed.
+- RFC 5280 6.1 certificate policy processing in the new `portable::policy` module: policy tree, policy mappings, `policyConstraints` (requireExplicitPolicy and inhibitPolicyMapping), `inhibitAnyPolicy`, anyPolicy expansion (including self-issued rollover) and user-initial-policy-set intersection. Inputs are supplied through `chain::PathOptions` and `chain::validate_with_options`; defaults require no policy yet honor every constraint the certificates carry. Critical `certificatePolicies` are accepted when they carry no qualifiers (previously rejected); policy mapping, constraint and inhibit extensions are no longer rejected. Trust-anchor `policyConstraints` and `inhibitAnyPolicy` are applied as anchor constraints.
+- Explicitly selected partial chains: `PathOptions::partial_chain` lets an exactly pinned, non-self-issued certificate end a path. The end-entity certificate never qualifies.
+- `ChainReport` now retains valid policies, per-certificate diagnostics (role, self-issued, enforced extensions) and a bounded list of rejected candidate paths with reasons.
 
 ## 0.1.1 - 2026-10-08
 

@@ -17,6 +17,43 @@ pub struct ChainReport {
     pub anchor_sha256: String,
     /// Exact pinned CA whose critical legacy Microsoft timestamp policy was interpreted.
     pub microsoft_timestamp_policy_certificate_sha256: Option<String>,
+    /// RFC 5280 6.1 `valid_policy` values at the end-entity level after
+    /// intersection with the initial policy set. Empty when the policy tree is NULL.
+    pub valid_policies: Vec<String>,
+    /// Per-certificate diagnostics for the selected path, end entity first.
+    pub certificates: Vec<CertificateDiagnostic>,
+    /// Bounded record of candidate paths rejected before this one was selected.
+    pub rejected_paths: Vec<RejectedPath>,
+}
+
+/// Role and enforced path-validation extensions of one certificate in a selected path.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CertificateDiagnostic {
+    pub sha256: String,
+    pub role: &'static str,
+    pub self_issued: bool,
+    /// Names of the RFC 5280 path-validation extensions present and enforced.
+    pub enforced_extensions: Vec<&'static str>,
+}
+
+/// A candidate path that failed validation, with the first failing reason.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RejectedPath {
+    /// Certificate SHA-256 values from the end entity toward the candidate issuer.
+    pub chain_sha256: Vec<String>,
+    pub reason: String,
+}
+
+const MAX_REJECTED_PATHS: usize = 32;
+
+/// Optional RFC 5280 behavior beyond the strict default.
+#[derive(Debug, Clone, Default)]
+pub struct PathOptions {
+    /// RFC 5280 6.1.1 policy inputs.
+    pub policy: super::policy::PolicyOptions,
+    /// Allow an exactly pinned certificate that is not self-issued to end the
+    /// path (a partial chain). The end-entity certificate itself never qualifies.
+    pub partial_chain: bool,
 }
 const MICROSOFT_TIMESTAMP_PCA_2010: &str =
     "86ec118d1ee69670a46e2be29c4b4208be043e36600d4e1dd3f3d515ca119020";
@@ -26,7 +63,7 @@ const MICROSOFT_TIMESTAMP_NOTICE: &str = "\u{201d}Legal_Policy_Statement.\u{201d
 
 // RFC5280 4.2.1.4 requires understanding critical policies including qualifiers.
 // This deliberately supports only the measured, hash-pinned Microsoft TSA CA
-// profile. It does not introduce generic policy-tree or constraint processing.
+// profile; general policy processing lives in the policy module.
 fn validate_microsoft_timestamp_policy(bytes: &[u8]) -> Result<()> {
     use x509_cert::ext::pkix::CertificatePolicies;
     ensure!(
@@ -437,30 +474,39 @@ fn validate_extensions(
     let mut interpreted_timestamp_policy = false;
     for e in t.extensions.iter().flatten() {
         ensure!(seen.insert(e.extn_id), "duplicate certificate extension");
-        ensure!(
-            !matches!(
-                e.extn_id.to_string().as_str(),
-                "2.5.29.36" | "2.5.29.54" | "2.5.29.33"
-            ),
-            "unsupported certificate constraint {} (critical or noncritical)",
-            e.extn_id
-        );
         if e.critical && e.extn_id.to_string() == "2.5.29.32" {
-            ensure!(
-                microsoft_timestamp_compatibility
-                    && !leaf
-                    && eku == "1.3.6.1.5.5.7.3.8"
-                    && hex::encode(Sha256::digest(certificate_der)) == MICROSOFT_TIMESTAMP_PCA_2010,
-                "unsupported critical certificate extension {}",
-                e.extn_id
-            );
-            validate_microsoft_timestamp_policy(e.extn_value.as_bytes())?;
-            interpreted_timestamp_policy = true;
+            if microsoft_timestamp_compatibility
+                && !leaf
+                && eku == "1.3.6.1.5.5.7.3.8"
+                && hex::encode(Sha256::digest(certificate_der)) == MICROSOFT_TIMESTAMP_PCA_2010
+            {
+                validate_microsoft_timestamp_policy(e.extn_value.as_bytes())?;
+                interpreted_timestamp_policy = true;
+            } else {
+                // RFC 5280 4.2.1.4: a critical policy extension must be fully
+                // interpreted, qualifiers included. No generic qualifier is.
+                let policies =
+                    x509_cert::ext::pkix::CertificatePolicies::from_der(e.extn_value.as_bytes())?;
+                ensure!(
+                    policies
+                        .0
+                        .iter()
+                        .all(|p| p.policy_qualifiers.as_ref().is_none_or(Vec::is_empty)),
+                    "unsupported critical certificate policy qualifier"
+                );
+            }
         } else if e.critical {
             ensure!(
                 matches!(
                     e.extn_id.to_string().as_str(),
-                    "2.5.29.19" | "2.5.29.15" | "2.5.29.37" | "2.5.29.30" | "2.5.29.17"
+                    "2.5.29.19"
+                        | "2.5.29.15"
+                        | "2.5.29.37"
+                        | "2.5.29.30"
+                        | "2.5.29.17"
+                        | "2.5.29.33"
+                        | "2.5.29.36"
+                        | "2.5.29.54"
                 ),
                 "unsupported critical certificate extension {}",
                 e.extn_id
@@ -647,6 +693,7 @@ pub fn validate_with_limits(
         allow_sha1,
         false,
         limits,
+        &PathOptions::default(),
         &mut |_| Ok(()),
     )
 }
@@ -669,6 +716,7 @@ fn validate_path(
         allow_sha1,
         microsoft_timestamp_compatibility,
         PathLimits::default(),
+        &PathOptions::default(),
         &mut |_| Ok(()),
     )
 }
@@ -695,8 +743,78 @@ pub fn validate_with_path_policy(
         allow_sha1,
         false,
         limits,
+        &PathOptions::default(),
         &mut accept_path,
     )
+}
+
+/// Like `validate_with_path_policy`, with explicit RFC 5280 policy inputs and
+/// optional partial-chain selection.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_with_options(
+    leaf_der: &[u8],
+    certs: &[Vec<u8>],
+    roots: &[Vec<u8>],
+    unix_time: u64,
+    required_eku: &str,
+    allow_sha1: bool,
+    limits: PathLimits,
+    options: &PathOptions,
+    mut accept_path: impl FnMut(&ChainReport) -> Result<()>,
+) -> Result<ChainReport> {
+    search_path(
+        leaf_der,
+        certs,
+        roots,
+        unix_time,
+        required_eku,
+        allow_sha1,
+        false,
+        limits,
+        options,
+        &mut accept_path,
+    )
+}
+
+fn diagnostic(
+    position: usize,
+    length: usize,
+    entry: &(&[u8], Certificate),
+) -> CertificateDiagnostic {
+    let (bytes, certificate) = entry;
+    let enforced = [
+        ("2.5.29.19", "basicConstraints"),
+        ("2.5.29.15", "keyUsage"),
+        ("2.5.29.37", "extendedKeyUsage"),
+        ("2.5.29.30", "nameConstraints"),
+        ("2.5.29.32", "certificatePolicies"),
+        ("2.5.29.33", "policyMappings"),
+        ("2.5.29.36", "policyConstraints"),
+        ("2.5.29.54", "inhibitAnyPolicy"),
+    ];
+    CertificateDiagnostic {
+        sha256: hex::encode(Sha256::digest(bytes)),
+        role: if position == 0 {
+            "end-entity"
+        } else if position + 1 == length {
+            "anchor"
+        } else {
+            "intermediate"
+        },
+        self_issued: certificate.tbs_certificate.subject == certificate.tbs_certificate.issuer,
+        enforced_extensions: enforced
+            .iter()
+            .filter(|(oid, _)| {
+                certificate
+                    .tbs_certificate
+                    .extensions
+                    .iter()
+                    .flatten()
+                    .any(|e| e.extn_id.to_string() == *oid)
+            })
+            .map(|(_, name)| *name)
+            .collect(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -709,6 +827,7 @@ fn search_path(
     allow_sha1: bool,
     microsoft_timestamp_compatibility: bool,
     limits: PathLimits,
+    options: &PathOptions,
     accept_path: &mut dyn FnMut(&ChainReport) -> Result<()>,
 ) -> Result<ChainReport> {
     use std::collections::{BTreeMap, HashSet};
@@ -761,6 +880,23 @@ fn search_path(
     let mut explored = 0usize;
     let mut signature_checks = 0usize;
     let mut last_error = anyhow::anyhow!("certificate issuer missing");
+    let mut rejected: Vec<RejectedPath> = Vec::new();
+    macro_rules! reject {
+        ($path:expr, $error:expr) => {{
+            let error = $error;
+            if rejected.len() < MAX_REJECTED_PATHS {
+                rejected.push(RejectedPath {
+                    chain_sha256: $path
+                        .iter()
+                        .map(|i| hex::encode(Sha256::digest(pool[*i].0)))
+                        .collect(),
+                    reason: format!("{error:#}"),
+                });
+            }
+            last_error = error;
+            continue;
+        }};
+    }
     while let Some((path, interpreted)) = pending.pop() {
         explored += 1;
         ensure!(
@@ -780,10 +916,7 @@ fn search_path(
             microsoft_timestamp_compatibility,
         ) {
             Ok(value) => interpreted || value,
-            Err(error) => {
-                last_error = error;
-                continue;
-            }
+            Err(error) => reject!(path, error),
         };
         if let Some((_, constraints)) = current
             .tbs_certificate
@@ -799,51 +932,82 @@ fn search_path(
                 check_certificate_names(child, &constraints)
             });
             if let Err(error) = result {
-                last_error = error;
-                continue;
+                reject!(path, error);
             }
         }
         if anchors.contains(bytes) {
-            if depth == 0 || current.tbs_certificate.issuer != current.tbs_certificate.subject {
-                last_error = anyhow::anyhow!("pinned root must be a self-issued CA, not the leaf");
-                continue;
+            if depth == 0 {
+                reject!(
+                    path,
+                    anyhow::anyhow!("pinned root must be a self-issued CA, not the leaf")
+                );
             }
-            signature_checks += 1;
-            ensure!(
-                signature_checks <= limits.max_signature_checks,
-                "certificate signature-check limit"
-            );
-            if let Err(error) = crypto::verify_certificate_with_policy(current, current, allow_sha1)
-            {
-                last_error = error;
-                continue;
+            let self_issued = current.tbs_certificate.issuer == current.tbs_certificate.subject;
+            if !self_issued && !options.partial_chain {
+                reject!(
+                    path,
+                    anyhow::anyhow!(
+                        "pinned root must be a self-issued CA, not the leaf; \
+                         partial chains require explicit selection"
+                    )
+                );
+            }
+            if self_issued {
+                signature_checks += 1;
+                ensure!(
+                    signature_checks <= limits.max_signature_checks,
+                    "certificate signature-check limit"
+                );
+                if let Err(error) =
+                    crypto::verify_certificate_with_policy(current, current, allow_sha1)
+                {
+                    reject!(path, error);
+                }
             }
             let anchor_sha256 = hex::encode(Sha256::digest(bytes));
             if microsoft_timestamp_compatibility
                 && !super::MICROSOFT_ROOTS.contains(&anchor_sha256.as_str())
             {
-                last_error = anyhow::anyhow!(
-                    "Microsoft timestamp compatibility requires an authorized Microsoft root"
+                reject!(
+                    path,
+                    anyhow::anyhow!(
+                        "Microsoft timestamp compatibility requires an authorized Microsoft root"
+                    )
                 );
-                continue;
             }
+            let ordered = path[..depth]
+                .iter()
+                .rev()
+                .map(|i| &pool[*i].1)
+                .collect::<Vec<_>>();
+            let outcome = match super::policy::process(&ordered, Some(current), &options.policy) {
+                Ok(outcome) => outcome,
+                Err(error) => reject!(path, error),
+            };
             let report = ChainReport {
                 anchor_sha256,
                 microsoft_timestamp_policy_certificate_sha256: interpreted
                     .then(|| MICROSOFT_TIMESTAMP_PCA_2010.to_owned()),
                 chain_der: path.iter().map(|i| pool[*i].0.to_vec()).collect(),
+                valid_policies: outcome
+                    .valid_policies
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                certificates: path
+                    .iter()
+                    .enumerate()
+                    .map(|(position, i)| diagnostic(position, path.len(), &pool[*i]))
+                    .collect(),
+                rejected_paths: rejected.clone(),
             };
             match accept_path(&report) {
                 Ok(()) => return Ok(report),
-                Err(error) => {
-                    last_error = error;
-                    continue;
-                }
+                Err(error) => reject!(path, error),
             }
         }
         if path.len() >= limits.max_depth {
-            last_error = anyhow::anyhow!("certificate path depth limit");
-            continue;
+            reject!(path, anyhow::anyhow!("certificate path depth limit"));
         }
         if let Some(candidates) = subjects.get(&current.tbs_certificate.issuer.to_der()?) {
             for &parent_index in candidates.iter().rev() {
@@ -862,6 +1026,17 @@ fn search_path(
                 if let Err(error) =
                     crypto::verify_certificate_with_policy(current, parent, allow_sha1)
                 {
+                    if rejected.len() < MAX_REJECTED_PATHS {
+                        let mut candidate = path.clone();
+                        candidate.push(parent_index);
+                        rejected.push(RejectedPath {
+                            chain_sha256: candidate
+                                .iter()
+                                .map(|i| hex::encode(Sha256::digest(pool[*i].0)))
+                                .collect(),
+                            reason: format!("{error:#}"),
+                        });
+                    }
                     last_error = error;
                     continue;
                 }
