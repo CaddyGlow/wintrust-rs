@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Require fresh delta CRLs before releasing a certificate hold.
+- Use supplied intermediate certificates in normal RFC3161 timestamp verification.
+- Exclude self-issued CA rollover certificates from path-length counts during path search and constraint rechecks.
+
 ## 0.1.2 - 2026-10-08
 
 ### Added

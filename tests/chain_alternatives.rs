@@ -213,3 +213,83 @@ fn untrusted_same_key_issuer_cycles_terminate_without_establishing_trust() {
     assert!(diagnostic.contains("no acceptable certificate path"));
     assert!(!diagnostic.contains("candidate limit"));
 }
+
+#[test]
+fn self_issued_rollover_is_exempt_from_path_length_but_other_cas_are_not() {
+    use p256::pkcs8::EncodePublicKey;
+    use signature::Signer;
+    let old_key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+    let new_key = p256::ecdsa::SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
+    let (leaf_der, _, roots) = fixture();
+    let prepare = |mut certificate: Certificate, key: &p256::ecdsa::SigningKey| {
+        certificate.tbs_certificate.subject_public_key_info =
+            x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(
+                key.verifying_key().to_public_key_der().unwrap().as_bytes(),
+            )
+            .unwrap();
+        certificate.tbs_certificate.signature.oid = "1.2.840.10045.4.3.2".parse().unwrap();
+        certificate.tbs_certificate.signature.parameters = None;
+        certificate.signature_algorithm = certificate.tbs_certificate.signature.clone();
+        certificate
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .retain(|e| !matches!(e.extn_id.to_string().as_str(), "2.5.29.14" | "2.5.29.35"));
+        certificate
+    };
+    let sign = |mut certificate: Certificate, key: &p256::ecdsa::SigningKey| {
+        let signature: p256::ecdsa::Signature =
+            key.sign(&certificate.tbs_certificate.to_der().unwrap());
+        certificate.signature =
+            der::asn1::BitString::from_bytes(signature.to_der().as_bytes()).unwrap();
+        certificate.to_der().unwrap()
+    };
+    let mut root = prepare(Certificate::from_der(&roots[0]).unwrap(), &old_key);
+    root.tbs_certificate
+        .extensions
+        .as_mut()
+        .unwrap()
+        .retain(|e| e.extn_id.to_string() != "2.5.29.19");
+    root.tbs_certificate
+        .extensions
+        .as_mut()
+        .unwrap()
+        .push(x509_cert::ext::Extension {
+            extn_id: "2.5.29.19".parse().unwrap(),
+            critical: true,
+            extn_value: der::asn1::OctetString::new(
+                x509_cert::ext::pkix::BasicConstraints {
+                    ca: true,
+                    path_len_constraint: Some(0),
+                }
+                .to_der()
+                .unwrap(),
+            )
+            .unwrap(),
+        });
+    let mut rollover = prepare(root.clone(), &new_key);
+    rollover.tbs_certificate.serial_number =
+        x509_cert::serial_number::SerialNumber::new(&[99]).unwrap();
+    let roots = vec![sign(root, &old_key)];
+    for self_issued in [true, false] {
+        let mut issuer = rollover.clone();
+        if !self_issued {
+            issuer.tbs_certificate.subject = "CN=Separate intermediate".parse().unwrap();
+        }
+        let mut leaf = prepare(Certificate::from_der(&leaf_der).unwrap(), &new_key);
+        leaf.tbs_certificate.issuer = issuer.tbs_certificate.subject.clone();
+        let result = chain::validate(
+            &sign(leaf, &new_key),
+            &[sign(issuer, &old_key)],
+            &roots,
+            TIME,
+            EKU,
+        );
+        if self_issued {
+            assert_eq!(result.unwrap().chain_der.len(), 3);
+        } else {
+            assert!(format!("{:#}", result.unwrap_err()).contains("CA path length exceeded"));
+        }
+    }
+}

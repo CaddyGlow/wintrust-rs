@@ -556,11 +556,18 @@ pub(super) fn evaluate(
         let mut effective = listing;
         let mut delta_fresh = false;
         if let Some((_, (delta_index, delta))) = latest {
+            match is_fresh(delta, now, limits) {
+                Ok(()) => delta_fresh = true,
+                Err(error) => diagnostics.push(format!("CRL {delta_index}: {error:#}")),
+            }
             match lookup(delta, certificate, now, limits) {
                 Ok(Some(entry)) if entry.revokes() => effective = Some(entry),
                 Ok(Some(_)) => {
                     // removeFromCRL only releases a certificate on hold.
-                    if effective.is_some_and(|l| l.reason == CrlReason::CertificateHold) {
+                    // Stale/future evidence may revoke, but cannot prove release.
+                    if delta_fresh
+                        && effective.is_some_and(|l| l.reason == CrlReason::CertificateHold)
+                    {
                         effective = None;
                     }
                 }
@@ -569,10 +576,6 @@ pub(super) fn evaluate(
                     diagnostics.push(format!("CRL {delta_index}: {error:#}"));
                     continue;
                 }
-            }
-            match is_fresh(delta, now, limits) {
-                Ok(()) => delta_fresh = true,
-                Err(error) => diagnostics.push(format!("CRL {delta_index}: {error:#}")),
             }
             used.insert(*delta_index);
         }

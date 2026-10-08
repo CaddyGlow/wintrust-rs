@@ -191,9 +191,11 @@ fn supplied_intermediate_completes_tsa_path_and_rejected_root_tries_alternative(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    assert!(
-        timestamp::verify_timestamps_with_policy(&signer, &issuers, &roots, now, false).is_err()
-    );
+    assert!(timestamp::verify_timestamps_with_policy(&signer, &[], &roots, now, false).is_err());
+    let supplied = timestamp::verify_timestamps_with_policy(&signer, &issuers, &roots, now, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(supplied.chain_der.len(), 3);
     let mut paths = 0;
     let verified = timestamp::verify_timestamps_with_path_policy(
         &signer,

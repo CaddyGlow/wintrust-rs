@@ -1039,3 +1039,27 @@ fn pinned_evidence_provenance_records_kind_location_and_digest() {
         hex::encode(sha2::Sha256::digest(&delta))
     );
 }
+
+#[test]
+fn stale_or_future_delta_cannot_release_certificate_hold() {
+    let p = pki(None);
+    let mut base = crl(&p);
+    base.entries = vec![entry(&p.leaf, Some(CrlReason::CertificateHold))];
+    for (this_update, next_update) in [
+        (TIME - 5, Some(TIME - 1)),
+        (TIME + 1, Some(TIME + 100)),
+        (TIME - 604_801, Some(TIME + 100)),
+        (TIME - 5, None),
+    ] {
+        let mut delta = crl(&p);
+        delta.base = Some(1);
+        delta.number = Some(2);
+        delta.this_update = this_update;
+        delta.next_update = next_update;
+        delta.entries = vec![entry(&p.leaf, Some(CrlReason::RemoveFromCRL))];
+        assert_eq!(
+            status(&p, &[base.der(), delta.der()]),
+            RevocationStatus::Revoked
+        );
+    }
+}

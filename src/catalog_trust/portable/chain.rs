@@ -1049,7 +1049,13 @@ fn search_path(
             unix_time,
             required_eku,
             depth == 0,
-            depth.saturating_sub(1),
+            path[..depth]
+                .iter()
+                .skip(1)
+                .filter(|i| {
+                    pool[**i].1.tbs_certificate.subject != pool[**i].1.tbs_certificate.issuer
+                })
+                .count(),
             bytes,
             microsoft_timestamp_compatibility,
             options.crl_signer,
@@ -1209,7 +1215,11 @@ pub(super) fn validate_report_constraints(
             unix_time,
             eku,
             depth == 0,
-            depth.saturating_sub(1),
+            certificates[..depth]
+                .iter()
+                .skip(1)
+                .filter(|c| c.tbs_certificate.subject != c.tbs_certificate.issuer)
+                .count(),
             bytes,
             false,
             false,

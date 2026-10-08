@@ -567,11 +567,7 @@ fn verify_timestamps_inner(
                 now,
                 allow_sha1,
                 noncritical_tsa_pins,
-                if accept_path.is_some() {
-                    certificates
-                } else {
-                    &[]
-                },
+                certificates,
                 limits,
                 accept_path
                     .as_mut()
