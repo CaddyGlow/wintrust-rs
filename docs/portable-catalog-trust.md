@@ -135,7 +135,7 @@ servicing correctness; see [external baseline selection](https://github.com/Cadd
 
 ## Rust API migration
 
-The 0.2.0 Rust API uses a single immutable `portable::Verifier` in place of
+The 0.3.0 Rust API uses a single immutable `portable::Verifier` in place of
 `PortableVerifier` and `ValidatedVerifier`. Use `Verifier::load`,
 `Verifier::from_policy`, or `Verifier::builder`. The injectable reader in
 `from_policy_with_reader` and `VerifierBuilder::build_with_reader` enforces the

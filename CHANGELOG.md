@@ -1,6 +1,17 @@
 # Changelog
 
+## 0.3.0 - 2026-10-09
+
+### Changed
+
+- Publish the refactored API described in the GitHub v0.2.0 source release to crates.io. The existing crates.io v0.2.0 package contains the earlier mutable `PortableVerifier` API and cannot be replaced.
+- **Breaking changes from crates.io v0.2.0:** default `no_std` with `alloc`; immutable `Verifier`; typed verification errors; feature-stable artifact identifiers; borrowed DER collections; consolidated verification options; typed OIDs and report categories. Enable `std` for filesystem APIs and automatic clock capture. Policy and report JSON formats remain compatible.
+- Include the timestamp interval/path-selection, revocation freshness, self-issued path-length, package-test and fuzz-lockfile fixes detailed below.
+
 ## 0.2.0 - 2026-10-08
+
+This section describes the GitHub source release. The crates.io package with the
+same version predates this refactor; use v0.3.0 for the API described here.
 
 ### Added
 
