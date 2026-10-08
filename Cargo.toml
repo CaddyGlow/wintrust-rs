@@ -1,6 +1,6 @@
 [package]
 name = "wintrust"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -19,6 +19,7 @@ include = [
   "/tests/api.rs",
   "/tests/chain_alternatives.rs",
   "/tests/cms_detached.rs",
+  "/tests/name_constraints.rs",
   "/tests/ctl.rs",
   "/tests/ctl_authentication.rs",
   "/tests/runtime_verifier.rs",

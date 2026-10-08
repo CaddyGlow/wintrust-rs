@@ -103,6 +103,321 @@ fn validate_microsoft_timestamp_policy(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// RFC 5280 4.2.1.10/6.1: every issuer's permitted union is intersected
+// with other issuers' unions; excluded subtrees take precedence. Evaluate the
+// path-local descendants instead of merging heterogeneous subtree encodings.
+fn validate_name_constraints(value: &x509_cert::ext::pkix::NameConstraints) -> Result<()> {
+    use x509_cert::ext::pkix::name::GeneralName;
+    ensure!(
+        value.permitted_subtrees.is_some() || value.excluded_subtrees.is_some(),
+        "empty name constraints"
+    );
+    for subtrees in [&value.permitted_subtrees, &value.excluded_subtrees]
+        .into_iter()
+        .flatten()
+    {
+        ensure!(
+            !subtrees.is_empty() && subtrees.len() <= 256,
+            "name constraint subtree count limit"
+        );
+        for subtree in subtrees {
+            ensure!(
+                subtree.minimum == 0 && subtree.maximum.is_none(),
+                "unsupported name constraint minimum/maximum"
+            );
+            match &subtree.base {
+                GeneralName::DnsName(name) | GeneralName::UniformResourceIdentifier(name) => {
+                    validate_domain(name.as_str().strip_prefix('.').unwrap_or(name.as_str()))?;
+                }
+                GeneralName::Rfc822Name(name) => {
+                    if name.as_str().contains('@') {
+                        split_mailbox(name.as_str())?;
+                    } else {
+                        validate_domain(name.as_str().strip_prefix('.').unwrap_or(name.as_str()))?;
+                    }
+                }
+                GeneralName::IpAddress(bytes) => {
+                    let bytes = bytes.as_bytes();
+                    ensure!(
+                        matches!(bytes.len(), 8 | 32),
+                        "invalid IP name constraint length"
+                    );
+                    let half = bytes.len() / 2;
+                    let mut zero = false;
+                    for byte in &bytes[half..] {
+                        for bit in (0..8).rev() {
+                            if byte & (1 << bit) == 0 {
+                                zero = true;
+                            } else {
+                                ensure!(!zero, "unsupported non-contiguous IP constraint mask");
+                            }
+                        }
+                    }
+                }
+                GeneralName::DirectoryName(name) => {
+                    ensure!(!name.0.is_empty(), "empty directory name constraint");
+                    normalize_dn(name)?;
+                }
+                _ => anyhow::bail!("unsupported name constraint form"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_domain(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name.len() <= 253,
+        "invalid constrained domain length"
+    );
+    for label in name.split('.') {
+        ensure!(
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            "invalid constrained domain label"
+        );
+    }
+    Ok(())
+}
+
+fn domain_matches(name: &str, constraint: &str, exact_host: bool) -> Result<bool> {
+    validate_domain(name)?;
+    let descendants_only = constraint.starts_with('.');
+    let base = constraint.strip_prefix('.').unwrap_or(constraint);
+    validate_domain(base)?;
+    if name.eq_ignore_ascii_case(base) {
+        return Ok(!descendants_only);
+    }
+    if exact_host && !descendants_only {
+        return Ok(false);
+    }
+    Ok(name.len() > base.len()
+        && name.as_bytes()[name.len() - base.len() - 1] == b'.'
+        && name[name.len() - base.len()..].eq_ignore_ascii_case(base))
+}
+
+fn split_mailbox(mailbox: &str) -> Result<(&str, &str)> {
+    let (local, host) = mailbox
+        .split_once('@')
+        .context("invalid constrained mailbox")?;
+    ensure!(
+        !local.is_empty()
+            && local
+                .bytes()
+                .all(|byte| byte.is_ascii() && !byte.is_ascii_control() && byte != b'@'),
+        "unsupported constrained mailbox local part"
+    );
+    validate_domain(host)?;
+    Ok((local, host))
+}
+
+fn uri_host(uri: &str) -> Result<&str> {
+    let (scheme, rest) = uri
+        .split_once("://")
+        .context("constrained URI requires a DNS authority")?;
+    ensure!(
+        !scheme.is_empty()
+            && scheme.as_bytes()[0].is_ascii_alphabetic()
+            && scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')),
+        "invalid URI scheme"
+    );
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    if let Some(port) = port {
+        ensure!(
+            !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()),
+            "invalid URI port"
+        );
+    }
+    validate_domain(host)?;
+    ensure!(
+        host.parse::<std::net::IpAddr>().is_err(),
+        "URI name constraint cannot authorize an IP host"
+    );
+    Ok(host)
+}
+
+// DirectoryString ASCII profiles use case/space folding across PrintableString
+// and UTF8String. Wider Unicode matching requires RFC4518 preparation; fail
+// closed rather than claim equivalence under incomplete Unicode normalization.
+fn normalize_dn(name: &x509_cert::name::Name) -> Result<Vec<Vec<(String, String)>>> {
+    name.0
+        .iter()
+        .map(|rdn| {
+            let mut attributes = rdn
+                .0
+                .iter()
+                .map(|attribute| {
+                    let value = &attribute.value;
+                    ensure!(
+                        matches!(
+                            value.tag(),
+                            Tag::Utf8String | Tag::PrintableString | Tag::Ia5String
+                        ),
+                        "unsupported directory name attribute syntax"
+                    );
+                    let text = std::str::from_utf8(value.value())?;
+                    ensure!(
+                        text.is_ascii() && !text.bytes().any(|byte| byte.is_ascii_control()),
+                        "unsupported international directory name constraint"
+                    );
+                    let oid = attribute.oid.to_string();
+                    let normalized = if oid == "1.2.840.113549.1.9.1" {
+                        let (local, host) = split_mailbox(text)?;
+                        format!("{local}@{}", host.to_ascii_lowercase())
+                    } else {
+                        ensure!(
+                            matches!(
+                                oid.as_str(),
+                                "2.5.4.3"
+                                    | "2.5.4.4"
+                                    | "2.5.4.5"
+                                    | "2.5.4.6"
+                                    | "2.5.4.7"
+                                    | "2.5.4.8"
+                                    | "2.5.4.9"
+                                    | "2.5.4.10"
+                                    | "2.5.4.11"
+                                    | "2.5.4.12"
+                                    | "2.5.4.13"
+                                    | "2.5.4.41"
+                                    | "2.5.4.42"
+                                    | "2.5.4.43"
+                                    | "2.5.4.44"
+                                    | "2.5.4.46"
+                                    | "2.5.4.65"
+                                    | "0.9.2342.19200300.100.1.25"
+                            ),
+                            "unsupported directory name attribute matching rule {oid}"
+                        );
+                        text.split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .to_ascii_lowercase()
+                    };
+                    Ok((oid, normalized))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            attributes.sort();
+            Ok(attributes)
+        })
+        .collect()
+}
+
+fn same_name_form(
+    a: &x509_cert::ext::pkix::name::GeneralName,
+    b: &x509_cert::ext::pkix::name::GeneralName,
+) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+fn within_subtree(
+    name: &x509_cert::ext::pkix::name::GeneralName,
+    base: &x509_cert::ext::pkix::name::GeneralName,
+) -> Result<bool> {
+    use x509_cert::ext::pkix::name::GeneralName;
+    match (name, base) {
+        (GeneralName::DnsName(name), GeneralName::DnsName(base)) => {
+            domain_matches(name.as_str(), base.as_str(), false)
+        }
+        (GeneralName::Rfc822Name(name), GeneralName::Rfc822Name(base)) => {
+            let (local, host) = split_mailbox(name.as_str())?;
+            if base.as_str().contains('@') {
+                let (expected_local, expected_host) = split_mailbox(base.as_str())?;
+                Ok(local == expected_local && host.eq_ignore_ascii_case(expected_host))
+            } else {
+                domain_matches(host, base.as_str(), true)
+            }
+        }
+        (
+            GeneralName::UniformResourceIdentifier(name),
+            GeneralName::UniformResourceIdentifier(base),
+        ) => domain_matches(uri_host(name.as_str())?, base.as_str(), true),
+        (GeneralName::IpAddress(name), GeneralName::IpAddress(base)) => {
+            let (name, base) = (name.as_bytes(), base.as_bytes());
+            ensure!(
+                matches!(name.len(), 4 | 16),
+                "invalid subject IP address length"
+            );
+            if base.len() != name.len() * 2 {
+                return Ok(false);
+            }
+            Ok(name
+                .iter()
+                .zip(&base[..name.len()])
+                .zip(&base[name.len()..])
+                .all(|((name, address), mask)| name & mask == address & mask))
+        }
+        (GeneralName::DirectoryName(name), GeneralName::DirectoryName(base)) => {
+            Ok(normalize_dn(name)?.starts_with(&normalize_dn(base)?))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn check_certificate_names(
+    certificate: &Certificate,
+    constraints: &x509_cert::ext::pkix::NameConstraints,
+) -> Result<()> {
+    use x509_cert::ext::pkix::{SubjectAltName, name::GeneralName};
+    let subject = &certificate.tbs_certificate.subject;
+    let san = certificate.tbs_certificate.get::<SubjectAltName>()?;
+    let mut names = san
+        .as_ref()
+        .map_or_else(Vec::new, |(_, names)| names.0.clone());
+    ensure!(names.len() <= 256, "subject alternative name count limit");
+    if !subject.0.is_empty() {
+        names.push(GeneralName::DirectoryName(subject.clone()));
+    }
+    if san.is_none() {
+        for rdn in &subject.0 {
+            for attribute in rdn.0.iter() {
+                if attribute.oid.to_string() == "1.2.840.113549.1.9.1" {
+                    names.push(GeneralName::Rfc822Name(
+                        attribute.value.decode_as::<der::asn1::Ia5String>()?,
+                    ));
+                }
+            }
+        }
+    }
+    for name in names {
+        for excluded in constraints.excluded_subtrees.iter().flatten() {
+            if same_name_form(&name, &excluded.base) {
+                ensure!(
+                    !within_subtree(&name, &excluded.base)?,
+                    "certificate name is in excluded subtree"
+                );
+            }
+        }
+        let permitted = constraints
+            .permitted_subtrees
+            .iter()
+            .flatten()
+            .filter(|subtree| same_name_form(&name, &subtree.base))
+            .collect::<Vec<_>>();
+        if !permitted.is_empty() {
+            let mut matched = false;
+            for subtree in permitted {
+                matched |= within_subtree(&name, &subtree.base)?;
+            }
+            ensure!(matched, "certificate name outside permitted subtrees");
+        }
+    }
+    Ok(())
+}
+
 fn validate_extensions(
     c: &Certificate,
     unix_time: u64,
@@ -125,7 +440,7 @@ fn validate_extensions(
         ensure!(
             !matches!(
                 e.extn_id.to_string().as_str(),
-                "2.5.29.30" | "2.5.29.36" | "2.5.29.54" | "2.5.29.33"
+                "2.5.29.36" | "2.5.29.54" | "2.5.29.33"
             ),
             "unsupported certificate constraint {} (critical or noncritical)",
             e.extn_id
@@ -145,10 +460,37 @@ fn validate_extensions(
             ensure!(
                 matches!(
                     e.extn_id.to_string().as_str(),
-                    "2.5.29.19" | "2.5.29.15" | "2.5.29.37"
+                    "2.5.29.19" | "2.5.29.15" | "2.5.29.37" | "2.5.29.30" | "2.5.29.17"
                 ),
                 "unsupported critical certificate extension {}",
                 e.extn_id
+            );
+        }
+    }
+    if let Some((critical, constraints)) = t.get::<x509_cert::ext::pkix::NameConstraints>()? {
+        ensure!(
+            !leaf && critical,
+            "unsupported certificate constraint: name constraints require a critical CA extension"
+        );
+        validate_name_constraints(&constraints)?;
+    }
+    if let Some((critical, names)) = t.get::<x509_cert::ext::pkix::SubjectAltName>()? {
+        use x509_cert::ext::pkix::name::GeneralName;
+        ensure!(
+            !names.0.is_empty() && names.0.len() <= 256,
+            "subject alternative name count limit"
+        );
+        if critical {
+            ensure!(
+                names.0.iter().all(|name| matches!(
+                    name,
+                    GeneralName::DnsName(_)
+                        | GeneralName::Rfc822Name(_)
+                        | GeneralName::UniformResourceIdentifier(_)
+                        | GeneralName::IpAddress(_)
+                        | GeneralName::DirectoryName(_)
+                )),
+                "unsupported critical subject alternative name form"
             );
         }
     }
@@ -443,6 +785,24 @@ fn search_path(
                 continue;
             }
         };
+        if let Some((_, constraints)) = current
+            .tbs_certificate
+            .get::<x509_cert::ext::pkix::NameConstraints>()?
+        {
+            let result = path[..depth].iter().try_for_each(|child_index| {
+                let child = &pool[*child_index].1;
+                if *child_index != leaf_index
+                    && child.tbs_certificate.subject == child.tbs_certificate.issuer
+                {
+                    return Ok(());
+                }
+                check_certificate_names(child, &constraints)
+            });
+            if let Err(error) = result {
+                last_error = error;
+                continue;
+            }
+        }
         if anchors.contains(bytes) {
             if depth == 0 || current.tbs_certificate.issuer != current.tbs_certificate.subject {
                 last_error = anyhow::anyhow!("pinned root must be a self-issued CA, not the leaf");
@@ -524,9 +884,14 @@ pub(super) fn validate_report_constraints(
     unix_time: u64,
     eku: &str,
 ) -> Result<()> {
-    for (depth, bytes) in report.chain_der.iter().enumerate() {
+    let certificates = report
+        .chain_der
+        .iter()
+        .map(|bytes| Certificate::from_der(bytes))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (depth, (bytes, certificate)) in report.chain_der.iter().zip(&certificates).enumerate() {
         validate_extensions(
-            &Certificate::from_der(bytes)?,
+            certificate,
             unix_time,
             eku,
             depth == 0,
@@ -534,6 +899,17 @@ pub(super) fn validate_report_constraints(
             bytes,
             false,
         )?;
+        if let Some((_, constraints)) = certificate
+            .tbs_certificate
+            .get::<x509_cert::ext::pkix::NameConstraints>()?
+        {
+            for (index, child) in certificates[..depth].iter().enumerate() {
+                if index != 0 && child.tbs_certificate.subject == child.tbs_certificate.issuer {
+                    continue;
+                }
+                check_certificate_names(child, &constraints)?;
+            }
+        }
     }
     Ok(())
 }
@@ -552,35 +928,47 @@ mod tests {
     use der::Encode;
     use x509_cert::ext::pkix::CertificatePolicies;
 
-    fn synthetic_policy() -> Vec<u8> {
-        use der::asn1::{Any, BmpString, Ia5String};
-        use x509_cert::ext::pkix::certpolicy::{PolicyInformation, PolicyQualifierInfo};
-
-        let cps = Ia5String::new(MICROSOFT_TIMESTAMP_CPS).unwrap();
-        // x509-cert's DisplayText currently omits BMPString, so encode the
-        // sole explicitText directly inside the UserNotice sequence.
-        let notice_text = BmpString::from_utf8(MICROSOFT_TIMESTAMP_NOTICE).unwrap();
-        let notice = Any::new(Tag::Sequence, notice_text.to_der().unwrap()).unwrap();
-        CertificatePolicies(vec![PolicyInformation {
-            policy_identifier: MICROSOFT_TIMESTAMP_POLICY.parse().unwrap(),
-            policy_qualifiers: Some(vec![
-                PolicyQualifierInfo {
-                    policy_qualifier_id: "1.3.6.1.5.5.7.2.1".parse().unwrap(),
-                    qualifier: Some(Any::from_der(&cps.to_der().unwrap()).unwrap()),
-                },
-                PolicyQualifierInfo {
-                    policy_qualifier_id: "1.3.6.1.5.5.7.2.2".parse().unwrap(),
-                    qualifier: Some(notice),
-                },
-            ]),
-        }])
-        .to_der()
-        .unwrap()
+    fn actual_policy() -> Vec<u8> {
+        let catalog = include_bytes!("../../../tests/fixtures/microsoft-legacy-wcf/catalog.cat");
+        let cms = super::super::signed::verify_signed_data_with_policy(
+            catalog,
+            "1.3.6.1.4.1.311.10.1",
+            false,
+        )
+        .unwrap();
+        let token = &cms.signers[0]
+            .unsigned_attributes
+            .iter()
+            .find(|(oid, _)| oid == super::super::timestamp::MICROSOFT_RFC3161_ATTRIBUTE)
+            .unwrap()
+            .1[0];
+        let timestamp = super::super::signed::verify_signed_data_with_policy(
+            token,
+            "1.2.840.113549.1.9.16.1.4",
+            false,
+        )
+        .unwrap();
+        let ca = timestamp
+            .certificates
+            .iter()
+            .find(|bytes| hex::encode(Sha256::digest(bytes)) == MICROSOFT_TIMESTAMP_PCA_2010)
+            .unwrap();
+        let certificate = Certificate::from_der(ca).unwrap();
+        certificate
+            .tbs_certificate
+            .extensions
+            .unwrap()
+            .into_iter()
+            .find(|e| e.extn_id.to_string() == "2.5.29.32")
+            .unwrap()
+            .extn_value
+            .as_bytes()
+            .to_vec()
     }
 
     #[test]
-    fn legacy_microsoft_policy_interprets_cps_and_notice_and_rejects_other_semantics() {
-        let original = synthetic_policy();
+    fn legacy_microsoft_policy_interprets_real_cps_and_notice_and_rejects_other_semantics() {
+        let original = actual_policy();
         validate_microsoft_timestamp_policy(&original).unwrap();
         let mut policy = CertificatePolicies::from_der(&original).unwrap();
         policy.0[0].policy_identifier = "1.2.3.4".parse().unwrap();

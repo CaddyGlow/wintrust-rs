@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 - 2026-10-08
+
+### Added
+
+- RFC 5280 name-constraint processing in the shared path validator for DNS, mailbox, URI DNS-host, IP CIDR and ASCII directory-name forms, including alternative paths, issuer intersections and self-issued rollover. Unsupported international DN matching, non-DNS URI hosts, other constraint forms and distance semantics fail closed.
+
 ## 0.1.1 - 2026-10-08
 
 ### Changed

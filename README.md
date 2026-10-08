@@ -4,7 +4,7 @@ Portable Rust catalog trust.
 
 ```toml
 [dependencies]
-wintrust = "0.1.1"
+wintrust = "0.1.2"
 ```
 
  The implementation includes CMS/CTL,
@@ -68,7 +68,7 @@ and [file hashing](https://learn.microsoft.com/en-us/windows/win32/api/mscat/nf-
 ## Migration from 0.1
 
 CRL/OCSP acquisition is now optional. Applications using `PortableRevocationPolicy::Online`
-must enable `wintrust = { version = "0.1.1", features = ["online"] }`.
+must enable `wintrust = { version = "0.1.2", features = ["online"] }`.
 Offline parsing and verification require no HTTP client. Existing function names,
 mutable-verifier compatibility APIs and Windows-name aliases remain available.
 New integrations should prefer the immutable runtime verifier.
