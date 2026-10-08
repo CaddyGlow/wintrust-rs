@@ -206,6 +206,7 @@ fn run(specs: Vec<Spec>, policy: PolicyOptions) -> anyhow::Result<chain::ChainRe
         &PathOptions {
             policy,
             partial_chain: false,
+            crl_signer: false,
         },
         |_| Ok(()),
     )
@@ -522,6 +523,7 @@ fn partial_chain_requires_explicit_selection_and_never_accepts_the_leaf() {
             &PathOptions {
                 policy: PolicyOptions::default(),
                 partial_chain,
+                crl_signer: false,
             },
             |_| Ok(()),
         )
@@ -791,6 +793,7 @@ fn openssl_agrees_on_policy_outcomes() {
             &PathOptions {
                 policy: case.policy,
                 partial_chain: false,
+                crl_signer: false,
             },
             |_| Ok(()),
         );

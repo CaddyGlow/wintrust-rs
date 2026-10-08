@@ -31,7 +31,7 @@ pub struct RevocationReport {
     pub certificates: Vec<CertificateStatus>,
     pub current_unix_time: u64,
     pub signature_verification_time: u64,
-    /// Origin of artifacts acquired online for this report; empty for supplied evidence.
+    /// Origin of the pinned and acquired evidence this report was computed from.
     pub provenance: Vec<ArtifactProvenance>,
 }
 #[derive(Debug, Clone, Copy)]
@@ -118,7 +118,14 @@ pub fn verify_crl(
     now: u64,
     limits: RevocationLimits,
 ) -> Result<RevocationStatus> {
-    let outcome = crl::evaluate(&[bytes], certificate, issuer, &[], now, limits)?;
+    let outcome = crl::evaluate(
+        &[bytes],
+        certificate,
+        std::slice::from_ref(issuer),
+        &[],
+        now,
+        limits,
+    )?;
     ensure!(
         outcome.status != RevocationStatus::Unknown,
         "CRL does not establish certificate status: {}",
@@ -412,7 +419,8 @@ pub fn verify_chain_revocation_with_signers(
             diagnostics: Vec::new(),
         };
         if !crls.is_empty() {
-            let outcome = crl::evaluate(&crl_refs, &path[i], &path[i + 1], &signers, now, limits)?;
+            let outcome =
+                crl::evaluate(&crl_refs, &path[i], &path[i + 1..], &signers, now, limits)?;
             for index in &outcome.used {
                 report.evidence_sha256.push(hash(&crls[*index])?);
             }
@@ -481,20 +489,61 @@ impl Default for OnlineLimits {
         }
     }
 }
-/// Where and when one acquired artifact came from.
+/// Where one piece of revocation evidence came from.
 #[derive(Debug, Clone, Serialize)]
 pub struct ArtifactProvenance {
     /// `crl`, `delta-crl` or `ocsp`.
     pub kind: &'static str,
-    pub url: String,
+    /// `online` for retrieved artifacts, `pinned-file` for policy-pinned cache files.
+    pub origin: &'static str,
+    /// The URL retrieved, or the policy artifact path.
+    pub location: String,
     pub sha256: String,
     pub bytes: usize,
-    /// Verification time at which the artifact was retrieved and authenticated.
-    pub retrieved_at: u64,
-    /// The certificate whose status the request concerned.
-    pub certificate_sha256: String,
-    /// `crl-distribution-point`, `freshest-crl` or `authority-info-access`.
+    /// Verification time at which an online artifact was retrieved and authenticated;
+    /// absent for pinned files, whose digest was verified when the policy was loaded.
+    pub retrieved_at: Option<u64>,
+    /// The certificate whose status an online request concerned.
+    pub certificate_sha256: Option<String>,
+    /// `crl-distribution-point`, `freshest-crl`, `authority-info-access` or `policy`.
     pub source: &'static str,
+}
+
+/// Provenance for policy-pinned evidence. Each artifact's digest was checked
+/// against its pin when the policy was loaded.
+pub fn pinned_provenance(
+    crls: &[(&std::path::Path, &[u8])],
+    ocsp: &[(&std::path::Path, &[u8])],
+) -> Result<Vec<ArtifactProvenance>> {
+    let mut out = Vec::new();
+    for (path, bytes) in crls {
+        let delta = crl::locations(bytes)
+            .map(|(delta, _)| delta)
+            .unwrap_or(false);
+        out.push(ArtifactProvenance {
+            kind: if delta { "delta-crl" } else { "crl" },
+            origin: "pinned-file",
+            location: path.display().to_string(),
+            sha256: hash(bytes)?,
+            bytes: bytes.len(),
+            retrieved_at: None,
+            certificate_sha256: None,
+            source: "policy",
+        });
+    }
+    for (path, bytes) in ocsp {
+        out.push(ArtifactProvenance {
+            kind: "ocsp",
+            origin: "pinned-file",
+            location: path.display().to_string(),
+            sha256: hash(bytes)?,
+            bytes: bytes.len(),
+            retrieved_at: None,
+            certificate_sha256: None,
+            source: "policy",
+        });
+    }
+    Ok(out)
 }
 #[derive(Debug, Default)]
 pub struct AcquiredRevocation {
@@ -701,7 +750,14 @@ pub fn acquire_chain_revocation_with_signers(
                 // A CRL is accepted when authenticated and authorized for this
                 // certificate. Completeness and freshness are decided later, so
                 // delta and scoped CRLs are retained.
-                let outcome = crl::evaluate(&[&bytes], cert, issuer, &signers, now, limits)?;
+                let outcome = crl::evaluate(
+                    &[&bytes],
+                    cert,
+                    &path[position + 1..],
+                    &signers,
+                    now,
+                    limits,
+                )?;
                 ensure!(
                     !outcome.relevant.is_empty(),
                     "online CRL not authenticated for the certificate: {}",
@@ -721,11 +777,12 @@ pub fn acquire_chain_revocation_with_signers(
                         } else {
                             "crl"
                         },
-                        url,
+                        origin: "online",
+                        location: url,
                         sha256: hash(&bytes)?,
                         bytes: bytes.len(),
-                        retrieved_at: now,
-                        certificate_sha256: certificate_sha256.clone(),
+                        retrieved_at: Some(now),
+                        certificate_sha256: Some(certificate_sha256.clone()),
                         source,
                     });
                     if is_ocsp {

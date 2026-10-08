@@ -287,12 +287,16 @@ fn malformed_unsupported_and_leaf_constraints_fail_closed() {
             constraints(vec![base], vec![])
         ));
     }
-    for (minimum, maximum) in [(1, None), (0, Some(1))] {
-        let mut nc = constraints(vec![dns("example.com")], vec![]);
-        nc.permitted_subtrees.as_mut().unwrap()[0].minimum = minimum;
-        nc.permitted_subtrees.as_mut().unwrap()[0].maximum = maximum;
-        assert!(!accepts(vec![dns("example.com")], nc));
+    // Distances are only defined for domain and directory names.
+    for base in [email("example.com"), uri("example.com")] {
+        let mut nc = constraints(vec![base], vec![]);
+        nc.permitted_subtrees.as_mut().unwrap()[0].minimum = 1;
+        assert!(!accepts(vec![], nc));
     }
+    let mut inverted = constraints(vec![dns("example.com")], vec![]);
+    inverted.permitted_subtrees.as_mut().unwrap()[0].minimum = 2;
+    inverted.permitted_subtrees.as_mut().unwrap()[0].maximum = Some(1);
+    assert!(!accepts(vec![dns("a.b.example.com")], inverted));
     assert!(!accepts(
         vec![],
         NameConstraints {
@@ -640,4 +644,173 @@ fn openssl_agrees_on_supported_name_constraint_outcomes() {
             expected
         );
     }
+}
+
+fn distance(permitted: bool, minimum: u32, maximum: Option<u32>) -> NameConstraints {
+    let mut nc = if permitted {
+        constraints(vec![dns("example.com")], vec![])
+    } else {
+        constraints(vec![], vec![dns("example.com")])
+    };
+    let subtree = if permitted {
+        &mut nc.permitted_subtrees
+    } else {
+        &mut nc.excluded_subtrees
+    };
+    subtree.as_mut().unwrap()[0].minimum = minimum;
+    subtree.as_mut().unwrap()[0].maximum = maximum;
+    nc
+}
+
+#[test]
+fn dns_minimum_and_maximum_count_labels_below_the_base() {
+    // Permitted [1, 1]: exactly one label below example.com.
+    for (name, expected) in [
+        ("example.com", false),
+        ("a.example.com", true),
+        ("A.Example.COM", true),
+        ("a.b.example.com", false),
+    ] {
+        assert_eq!(
+            accepts(vec![dns(name)], distance(true, 1, Some(1))),
+            expected,
+            "{name}"
+        );
+    }
+    // Excluded from depth 2: shallow names stay allowed (no permitted subtrees).
+    for (name, expected) in [
+        ("example.com", true),
+        ("a.example.com", true),
+        ("a.b.example.com", false),
+        ("a.b.c.example.com", false),
+    ] {
+        assert_eq!(
+            accepts(vec![dns(name)], distance(false, 2, None)),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn directory_name_minimum_and_maximum_count_rdns_below_the_base() {
+    let base = || GeneralName::DirectoryName("O=Example,C=US".parse().unwrap());
+    let run = |subject: &str, minimum: u32, maximum: Option<u32>| {
+        let (mut leaf, mut root) = templates();
+        leaf.tbs_certificate.subject = subject.parse().unwrap();
+        let mut nc = constraints(vec![base()], vec![]);
+        nc.permitted_subtrees.as_mut().unwrap()[0].minimum = minimum;
+        nc.permitted_subtrees.as_mut().unwrap()[0].maximum = maximum;
+        root.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(extension("2.5.29.30", nc.to_der().unwrap(), true));
+        chain::validate(&sign(leaf), &[], &[sign(root)], TIME, EKU).is_ok()
+    };
+    assert!(run("O=Example,C=US", 0, Some(0)));
+    assert!(!run("O=Example,C=US", 1, None));
+    assert!(run("CN=Signer,O=Example,C=US", 1, Some(1)));
+    assert!(!run("CN=Signer,O=Example,C=US", 0, Some(0)));
+    assert!(!run("CN=Signer,O=Example,C=US", 2, None));
+    assert!(!run("CN=Deep,OU=Unit,O=Example,C=US", 0, Some(1)));
+}
+
+#[test]
+fn uri_without_a_dns_host_is_outside_domain_subtrees() {
+    for value in [
+        "https://192.0.2.1/x",
+        "https://[2001:db8::1]:8443/",
+        "urn:example:thing",
+    ] {
+        // Not excluded by a domain exclusion, and never permitted by a domain permission.
+        assert!(accepts(
+            vec![uri(value)],
+            constraints(vec![], vec![uri(".example.com")])
+        ));
+        assert!(!accepts(
+            vec![uri(value)],
+            constraints(vec![uri(".example.com")], vec![])
+        ));
+    }
+    assert!(!accepts(
+        vec![uri("https://host.example.com/")],
+        constraints(vec![], vec![uri(".example.com")])
+    ));
+    // A malformed authority still fails closed.
+    assert!(!accepts(
+        vec![uri("https://host.example.com:port/")],
+        constraints(vec![], vec![uri(".example.com")])
+    ));
+}
+
+fn dn_with(value: der::Any, oid: &str) -> Name {
+    use x509_cert::{
+        attr::AttributeTypeAndValue,
+        name::{RdnSequence, RelativeDistinguishedName},
+    };
+    let attribute = AttributeTypeAndValue {
+        oid: oid.parse().unwrap(),
+        value,
+    };
+    RdnSequence(vec![RelativeDistinguishedName(
+        vec![attribute].try_into().unwrap(),
+    )])
+}
+use x509_cert::name::Name;
+
+fn dn_accepts(permitted: Name, subject: Name) -> bool {
+    let (mut leaf, mut root) = templates();
+    leaf.tbs_certificate.subject = subject;
+    root.tbs_certificate
+        .extensions
+        .as_mut()
+        .unwrap()
+        .push(extension(
+            "2.5.29.30",
+            constraints(vec![GeneralName::DirectoryName(permitted)], vec![])
+                .to_der()
+                .unwrap(),
+            true,
+        ));
+    chain::validate(&sign(leaf), &[], &[sign(root)], TIME, EKU).is_ok()
+}
+fn text(tag: der::Tag, bytes: &[u8]) -> der::Any {
+    der::Any::new(tag, bytes.to_vec()).unwrap()
+}
+fn utf16(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(u16::to_be_bytes).collect()
+}
+
+#[test]
+fn international_directory_names_use_rfc4518_preparation() {
+    let o = "2.5.4.10";
+    let utf8 = |s: &str| dn_with(text(der::Tag::Utf8String, s.as_bytes()), o);
+    let bmp = |s: &str| dn_with(text(der::Tag::BmpString, &utf16(s)), o);
+    // Case and internal/outer space folding apply to non-ASCII letters.
+    assert!(dn_accepts(
+        utf8("M\u{fc}ller GmbH"),
+        utf8("  M\u{dc}LLER    gmbh ")
+    ));
+    // Composed and decomposed forms are equal after NFKC.
+    assert!(dn_accepts(utf8("M\u{fc}ller"), utf8("Mu\u{308}ller")));
+    // Compatibility forms fold: full-width letters equal their ASCII forms.
+    assert!(dn_accepts(utf8("Example"), utf8("\u{ff25}xample")));
+    // Special case folding: sharp s equals ss.
+    assert!(dn_accepts(utf8("STRASSE"), utf8("Stra\u{df}e")));
+    // BMPString and UTF8String of the same text are equal.
+    assert!(dn_accepts(utf8("M\u{fc}ller"), bmp("M\u{dc}ller")));
+    // Different letters are different names.
+    assert!(!dn_accepts(utf8("M\u{fc}ller"), utf8("Muller")));
+    // Characters the profile prohibits make the name unusable.
+    assert!(!dn_accepts(utf8("Example"), utf8("Exam\u{e000}ple")));
+    assert!(!dn_accepts(utf8("Example"), utf8("Exam\u{fdd0}ple")));
+    // Non-ASCII Teletex has no unambiguous mapping.
+    assert!(!dn_accepts(
+        utf8("Example"),
+        dn_with(text(der::Tag::TeletexString, &[0xfc]), o)
+    ));
+    // Right-to-left strings must satisfy the bidirectional rule.
+    assert!(!dn_accepts(utf8("Example"), utf8("\u{5d0}abc")));
+    assert!(dn_accepts(utf8("\u{5d0}\u{5d1}"), utf8("\u{5d0}\u{5d1}")));
 }

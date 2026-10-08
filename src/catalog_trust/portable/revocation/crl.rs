@@ -100,58 +100,52 @@ fn authority_matches(aki_der: &[u8], signer: &Certificate) -> Result<bool> {
     Ok(true)
 }
 
-/// A CRL signing certificate other than the issuer must be directly issued by it.
+/// A CRL signing certificate other than the issuer must validate to the same
+/// trust anchor as the certificate being checked (RFC 5280 6.3.3 (f)): full path
+/// validation with time, constraints and policies, but no purpose requirement
+/// beyond `cRLSign`. The signer's own revocation status is not evaluated.
 fn authorize_signer(
     candidate: &Certificate,
-    issuer: &Certificate,
+    ancestry: &[Certificate],
+    pool: &[Certificate],
     now: u64,
     limits: RevocationLimits,
 ) -> Result<()> {
-    let tbs = &candidate.tbs_certificate;
-    ensure!(
-        tbs.issuer == issuer.tbs_certificate.subject,
-        "CRL signer not issued by the certificate issuer"
-    );
-    ensure!(
-        candidate.signature_algorithm == tbs.signature,
-        "CRL signer signature algorithm mismatch"
-    );
-    extensions_supported(
-        tbs.extensions.as_deref(),
-        &[
-            "2.5.29.19",
-            "2.5.29.15",
-            "2.5.29.37",
-            "2.5.29.14",
-            "2.5.29.35",
-            "2.5.29.31",
-        ],
-    )?;
-    ensure!(
-        tbs.validity.not_before.to_unix_duration().as_secs() <= now
-            && now <= tbs.validity.not_after.to_unix_duration().as_secs(),
-        "CRL signer outside validity interval"
-    );
-    verify_signature(
-        issuer,
-        &candidate.signature_algorithm.to_der()?,
-        &tbs.to_der()?,
-        candidate
-            .signature
-            .as_bytes()
-            .context("unaligned CRL signer signature")?,
+    use super::super::chain::{self, PathLimits, PathOptions};
+    let anchor = ancestry.last().context("CRL signer path has no anchor")?;
+    let mut intermediates = Vec::new();
+    for certificate in ancestry[..ancestry.len() - 1].iter().chain(pool) {
+        if certificate != candidate {
+            intermediates.push(certificate.to_der()?);
+        }
+    }
+    chain::validate_with_options(
+        &candidate.to_der()?,
+        &intermediates,
+        &[anchor.to_der()?],
+        now,
+        "",
         limits.allow_sha1,
+        PathLimits::default(),
+        &PathOptions {
+            crl_signer: true,
+            ..PathOptions::default()
+        },
+        |_| Ok(()),
     )
+    .map(drop)
+    .context("CRL signer does not chain to the trust anchor")
 }
 
 fn authenticate(
     bytes: &[u8],
-    issuer: &Certificate,
+    ancestry: &[Certificate],
     signers: &[Certificate],
     now: u64,
     limits: RevocationLimits,
 ) -> Result<Parsed> {
     ensure!(bytes.len() <= limits.max_artifact_bytes, "CRL byte limit");
+    let issuer = ancestry.first().context("CRL certificate issuer missing")?;
     let list = CertificateList::from_der(bytes)?;
     let tbs = &list.tbs_cert_list;
     ensure!(
@@ -234,7 +228,7 @@ fn authenticate(
                 .context("CRL signer keyUsage missing")?;
             ensure!(usage.1.crl_sign(), "CRL signer lacks cRLSign usage");
             if position > 0 && candidate != issuer {
-                authorize_signer(candidate, issuer, now, limits)?;
+                authorize_signer(candidate, ancestry, signers, now, limits)?;
             }
             if let Some(aki) = &aki_der {
                 ensure!(
@@ -362,23 +356,27 @@ fn bound(crl: &Parsed, certificate: &Certificate, point: &DistributionPoint) -> 
     }
 }
 
-fn names_match(idp: &DistributionPointName, point: &DistributionPointName) -> bool {
-    match (idp, point) {
-        (DistributionPointName::FullName(a), DistributionPointName::FullName(b)) => {
-            a.iter().any(|name| b.contains(name))
+/// Names a distribution point name denotes. A relative name extends `base`
+/// (the issuer of the CRL it appears in or the `cRLIssuer` it is relative to).
+fn full_names(name: &DistributionPointName, base: &Name) -> Vec<GeneralName> {
+    match name {
+        DistributionPointName::FullName(names) => names.clone(),
+        DistributionPointName::NameRelativeToCRLIssuer(rdn) => {
+            let mut full = base.clone();
+            full.0.push(rdn.clone());
+            vec![GeneralName::DirectoryName(full)]
         }
-        (
-            DistributionPointName::NameRelativeToCRLIssuer(a),
-            DistributionPointName::NameRelativeToCRLIssuer(b),
-        ) => a == b,
-        // Converting between forms needs the full DP issuer name; fail closed.
-        _ => false,
     }
 }
 
 /// Reasons this CRL covers for `certificate` under distribution point `point`,
 /// or `None` when the CRL's scope excludes the certificate.
-fn scope(crl: &Parsed, is_ca: bool, point: &DistributionPoint) -> Option<u16> {
+fn scope(
+    crl: &Parsed,
+    certificate: &Certificate,
+    is_ca: bool,
+    point: &DistributionPoint,
+) -> Option<u16> {
     let mut mask = ALL_REASONS;
     if let Some(reasons) = point.reasons {
         mask &= bits(reasons);
@@ -386,21 +384,29 @@ fn scope(crl: &Parsed, is_ca: bool, point: &DistributionPoint) -> Option<u16> {
     if let Some(idp) = &crl.idp {
         if let Some(name) = &idp.distribution_point {
             let issuer = crl.issuer();
+            let idp_names = full_names(name, issuer);
+            let responsible = point.crl_issuer.as_ref();
             let matches = match &point.distribution_point {
                 Some(point_name) => {
-                    names_match(name, point_name)
-                        || point.crl_issuer.as_ref().is_some_and(|names| {
+                    let base = responsible
+                        .and_then(|names| {
+                            names.iter().find_map(|n| match n {
+                                GeneralName::DirectoryName(x) => Some(x),
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or(&certificate.tbs_certificate.issuer);
+                    let point_names = full_names(point_name, base);
+                    idp_names.iter().any(|n| point_names.contains(n))
+                        || responsible.is_some_and(|names| {
                             names
                                 .iter()
                                 .any(|n| matches!(n, GeneralName::DirectoryName(x) if x == issuer))
                         })
                 }
-                None => match (name, &point.crl_issuer) {
-                    (DistributionPointName::FullName(idp_names), Some(names)) => {
-                        idp_names.iter().any(|n| names.contains(n))
-                    }
-                    _ => false,
-                },
+                None => {
+                    responsible.is_some_and(|names| idp_names.iter().any(|n| names.contains(n)))
+                }
             };
             if !matches {
                 return None;
@@ -444,16 +450,18 @@ fn is_fresh(crl: &Parsed, now: u64, limits: RevocationLimits) -> Result<()> {
     fresh(crl.this_update, crl.next_update, now, limits)
 }
 
-/// Evaluate `crls` for `certificate`, issued by the already validated `issuer`.
+/// Evaluate `crls` for `certificate`. `ancestry` runs from its already validated
+/// issuer up to the trust anchor.
 /// `signers` are candidate CRL signing certificates and are authenticated here.
 pub(super) fn evaluate(
     crls: &[&[u8]],
     certificate: &Certificate,
-    issuer: &Certificate,
+    ancestry: &[Certificate],
     signers: &[Certificate],
     now: u64,
     limits: RevocationLimits,
 ) -> Result<CrlOutcome> {
+    let issuer = ancestry.first().context("CRL certificate issuer missing")?;
     ensure!(
         certificate.tbs_certificate.issuer == issuer.tbs_certificate.subject,
         "CRL certificate issuer mismatch"
@@ -461,7 +469,7 @@ pub(super) fn evaluate(
     let mut diagnostics = Vec::new();
     let mut parsed = Vec::new();
     for (index, bytes) in crls.iter().enumerate() {
-        match authenticate(bytes, issuer, signers, now, limits) {
+        match authenticate(bytes, ancestry, signers, now, limits) {
             Ok(crl) => parsed.push((index, crl)),
             Err(error) => diagnostics.push(format!("CRL {index}: {error:#}")),
         }
@@ -492,7 +500,7 @@ pub(super) fn evaluate(
         for point in &points {
             if bound(crl, certificate, point) {
                 is_bound = true;
-                if let Some(covered) = scope(crl, is_ca, point) {
+                if let Some(covered) = scope(crl, certificate, is_ca, point) {
                     mask |= covered;
                 }
             }
@@ -607,7 +615,6 @@ pub(super) fn evaluate(
 
 /// Whether `bytes` is a delta CRL and the `freshestCRL` URIs it advertises.
 /// Parsing only: nothing here authenticates the CRL.
-#[cfg(feature = "online")]
 pub(super) fn locations(bytes: &[u8]) -> Result<(bool, Vec<String>)> {
     use x509_cert::ext::pkix::FreshestCrl;
     let list = CertificateList::from_der(bytes)?;

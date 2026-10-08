@@ -328,6 +328,14 @@ pub struct PortableTrustReport {
     pub trust_established: bool,
 }
 
+/// Pair each pinned artifact path with its loaded bytes.
+fn pinned_artifacts<'a>(refs: &'a [ArtifactRef], data: &'a [Vec<u8>]) -> Vec<(&'a Path, &'a [u8])> {
+    refs.iter()
+        .map(|artifact| artifact.path.as_path())
+        .zip(data.iter().map(Vec::as_slice))
+        .collect()
+}
+
 impl PortableVerifier {
     /// Verify an explicit catalog/member pair entirely through portable Rust.
     pub fn verify_catalog_member(
@@ -515,7 +523,10 @@ impl PortableVerifier {
         let mut crls = self.crls.clone();
         let mut ocsp = self.ocsp_responses.clone();
         let mut diagnostics = Vec::new();
-        let mut provenance = Vec::new();
+        let mut provenance = revocation::pinned_provenance(
+            &pinned_artifacts(&self.policy.crls, &self.crls),
+            &pinned_artifacts(&self.policy.ocsp_responses, &self.ocsp_responses),
+        )?;
         if self.policy.revocation == PortableRevocationPolicy::Online {
             let remaining = self
                 .limits
@@ -536,7 +547,7 @@ impl PortableVerifier {
             crls.extend(acquired.crls);
             ocsp.extend(acquired.ocsp_responses);
             diagnostics = acquired.diagnostics;
-            provenance = acquired.provenance;
+            provenance.extend(acquired.provenance);
         }
         let mut report = revocation::verify_chain_revocation_with_signers(
             path,

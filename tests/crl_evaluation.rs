@@ -846,3 +846,196 @@ fn openssl_agrees_on_crl_outcomes() {
         );
     }
 }
+
+/// A CA-capable certificate issued by `parent` (signed with the shared test key).
+fn issued(
+    parent: &Certificate,
+    subject: &str,
+    serial: u8,
+    public_seed: Option<[u8; 32]>,
+) -> Certificate {
+    let mut cert = parent.clone();
+    cert.tbs_certificate.subject = name(subject);
+    cert.tbs_certificate.issuer = parent.tbs_certificate.subject.clone();
+    cert.tbs_certificate.serial_number = SerialNumber::new(&[serial]).unwrap();
+    if let Some(seed) = public_seed {
+        let public = SigningKey::from_bytes((&seed).into())
+            .unwrap()
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap();
+        cert.tbs_certificate.subject_public_key_info =
+            x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(public.as_bytes()).unwrap();
+    }
+    sign_certificate(cert)
+}
+
+fn indirect_setup() -> (Pki, Name) {
+    let crl_issuer = name("CN=CRL Signer");
+    let p = pki(Some(vec![DistributionPoint {
+        distribution_point: None,
+        reasons: None,
+        crl_issuer: Some(vec![GeneralName::DirectoryName(crl_issuer.clone())]),
+    }]));
+    (p, crl_issuer)
+}
+fn indirect_revoking(p: &Pki, crl_issuer: &Name) -> Vec<u8> {
+    let mut c = crl(p);
+    c.issuer = crl_issuer.clone();
+    c.idp = Some(IssuingDistributionPoint {
+        indirect_crl: true,
+        ..idp()
+    });
+    c.entries = vec![Entry {
+        certificate_issuer: Some(p.root.tbs_certificate.subject.clone()),
+        ..entry(&p.leaf, None)
+    }];
+    c.der()
+}
+
+#[test]
+fn crl_signers_may_sit_several_levels_below_the_anchor() {
+    let (p, crl_issuer) = indirect_setup();
+    let mid = issued(&p.root, "CN=Mid CA", 60, None);
+    let deep = issued(&mid, "CN=CRL Signer", 61, None);
+    let crl = indirect_revoking(&p, &crl_issuer);
+    let both = [mid.clone(), deep.clone()];
+    assert_eq!(
+        evaluate(&p, std::slice::from_ref(&crl), &both).status,
+        RevocationStatus::Revoked
+    );
+    // Without the intermediate the signer's path to the anchor is incomplete.
+    assert_eq!(
+        evaluate(&p, std::slice::from_ref(&crl), std::slice::from_ref(&deep)).status,
+        RevocationStatus::Unknown
+    );
+    // A signer chaining to a different authority is not accepted.
+    let stranger = issued(&p.root, "CN=Stranger CA", 62, None);
+    let mut outsider = issued(&stranger, "CN=CRL Signer", 63, None);
+    outsider.tbs_certificate.issuer = name("CN=Unknown CA");
+    let outsider = sign_certificate(outsider);
+    assert_eq!(
+        evaluate(&p, std::slice::from_ref(&crl), &[stranger, outsider]).status,
+        RevocationStatus::Unknown
+    );
+    // The signer must be able to sign CRLs.
+    let mut no_crl_sign = deep.clone();
+    no_crl_sign
+        .tbs_certificate
+        .extensions
+        .as_mut()
+        .unwrap()
+        .retain(|e| e.extn_id.to_string() != "2.5.29.15");
+    no_crl_sign
+        .tbs_certificate
+        .extensions
+        .as_mut()
+        .unwrap()
+        .push(extension(
+            "2.5.29.15",
+            x509_cert::ext::pkix::KeyUsage(
+                x509_cert::ext::pkix::KeyUsages::DigitalSignature.into(),
+            )
+            .to_der()
+            .unwrap(),
+            true,
+        ));
+    let no_crl_sign = sign_certificate(no_crl_sign);
+    assert_eq!(
+        evaluate(&p, std::slice::from_ref(&crl), &[mid.clone(), no_crl_sign]).status,
+        RevocationStatus::Unknown
+    );
+    // Expired signers are refused.
+    let mut expired = deep.clone();
+    expired.tbs_certificate.validity.not_after = time(TIME - 10);
+    let expired = sign_certificate(expired);
+    assert_eq!(
+        evaluate(&p, &[crl], &[mid, expired]).status,
+        RevocationStatus::Unknown
+    );
+}
+
+#[test]
+fn rolled_over_crl_signing_key_with_the_issuer_name_is_accepted() {
+    let p = pki(None);
+    let successor = issued(&p.root, "CN=Independent Fixture Root", 70, Some([9; 32]));
+    let mut revoking = crl(&p);
+    revoking.signing_key = [9; 32];
+    revoking.entries.push(entry(&p.leaf, None));
+    let mut good = crl(&p);
+    good.signing_key = [9; 32];
+    for (list, expected) in [
+        (good.der(), RevocationStatus::Good),
+        (revoking.der(), RevocationStatus::Revoked),
+    ] {
+        assert_eq!(
+            evaluate(
+                &p,
+                std::slice::from_ref(&list),
+                std::slice::from_ref(&successor)
+            )
+            .status,
+            expected
+        );
+        // Without the successor certificate the unknown key verifies nothing.
+        assert_eq!(evaluate(&p, &[list], &[]).status, RevocationStatus::Unknown);
+    }
+}
+
+#[test]
+fn relative_distribution_point_names_resolve_against_the_issuer() {
+    let rdn = name("CN=partition1").0[0].clone();
+    let relative = DistributionPointName::NameRelativeToCRLIssuer(rdn.clone());
+    let p = pki(Some(vec![DistributionPoint {
+        distribution_point: Some(relative.clone()),
+        reasons: None,
+        crl_issuer: None,
+    }]));
+    let scoped = |name: DistributionPointName| {
+        let mut c = crl(&p);
+        c.idp = Some(IssuingDistributionPoint {
+            distribution_point: Some(name),
+            ..idp()
+        });
+        c.der()
+    };
+    let mut full = p.root.tbs_certificate.subject.clone();
+    full.0.push(rdn.clone());
+    let absolute = DistributionPointName::FullName(vec![GeneralName::DirectoryName(full)]);
+    assert_eq!(status(&p, &[scoped(relative)]), RevocationStatus::Good);
+    assert_eq!(status(&p, &[scoped(absolute)]), RevocationStatus::Good);
+    let other = DistributionPointName::NameRelativeToCRLIssuer(name("CN=partition2").0[0].clone());
+    assert_eq!(status(&p, &[scoped(other)]), RevocationStatus::Unknown);
+}
+
+#[test]
+fn pinned_evidence_provenance_records_kind_location_and_digest() {
+    let p = pki(None);
+    let base = crl(&p).der();
+    let mut delta = crl(&p);
+    delta.number = Some(2);
+    delta.base = Some(1);
+    let delta = delta.der();
+    let ocsp = vec![1u8, 2, 3];
+    let provenance = revocation::pinned_provenance(
+        &[
+            (std::path::Path::new("evidence/base.crl"), base.as_slice()),
+            (std::path::Path::new("evidence/delta.crl"), delta.as_slice()),
+        ],
+        &[(std::path::Path::new("evidence/leaf.ocsp"), ocsp.as_slice())],
+    )
+    .unwrap();
+    let kinds = provenance.iter().map(|a| a.kind).collect::<Vec<_>>();
+    assert_eq!(kinds, ["crl", "delta-crl", "ocsp"]);
+    assert!(provenance.iter().all(|a| a.origin == "pinned-file"
+        && a.source == "policy"
+        && a.retrieved_at.is_none()
+        && a.certificate_sha256.is_none()));
+    assert_eq!(provenance[0].location, "evidence/base.crl");
+    assert_eq!(provenance[0].bytes, base.len());
+    use sha2::Digest;
+    assert_eq!(
+        provenance[1].sha256,
+        hex::encode(sha2::Sha256::digest(&delta))
+    );
+}

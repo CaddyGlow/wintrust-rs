@@ -54,6 +54,9 @@ pub struct PathOptions {
     /// Allow an exactly pinned certificate that is not self-issued to end the
     /// path (a partial chain). The end-entity certificate itself never qualifies.
     pub partial_chain: bool,
+    /// Validate the end-entity certificate as a CRL signer: it may be a CA or
+    /// an end entity and no extended key usage is required. The caller checks `cRLSign`.
+    pub crl_signer: bool,
 }
 const MICROSOFT_TIMESTAMP_PCA_2010: &str =
     "86ec118d1ee69670a46e2be29c4b4208be043e36600d4e1dd3f3d515ca119020";
@@ -158,10 +161,21 @@ fn validate_name_constraints(value: &x509_cert::ext::pkix::NameConstraints) -> R
             "name constraint subtree count limit"
         );
         for subtree in subtrees {
-            ensure!(
-                subtree.minimum == 0 && subtree.maximum.is_none(),
-                "unsupported name constraint minimum/maximum"
-            );
+            // RFC 5280 4.2.1.10: other values must be processed or rejected. Level
+            // distances are defined for domain names and distinguished names only.
+            if subtree.minimum != 0 || subtree.maximum.is_some() {
+                ensure!(
+                    matches!(
+                        subtree.base,
+                        GeneralName::DnsName(_) | GeneralName::DirectoryName(_)
+                    ),
+                    "unsupported name constraint minimum/maximum"
+                );
+                ensure!(
+                    subtree.maximum.is_none_or(|max| max >= subtree.minimum),
+                    "name constraint maximum below minimum"
+                );
+            }
             match &subtree.base {
                 GeneralName::DnsName(name) | GeneralName::UniformResourceIdentifier(name) => {
                     validate_domain(name.as_str().strip_prefix('.').unwrap_or(name.as_str()))?;
@@ -253,10 +267,14 @@ fn split_mailbox(mailbox: &str) -> Result<(&str, &str)> {
     Ok((local, host))
 }
 
-fn uri_host(uri: &str) -> Result<&str> {
-    let (scheme, rest) = uri
-        .split_once("://")
-        .context("constrained URI requires a DNS authority")?;
+/// The DNS host of a URI, or `None` when it has no authority or names an IP
+/// address. Such URIs lie outside every domain subtree (RFC 5280 4.2.1.10), so
+/// they can never satisfy a permitted URI constraint nor be excluded by one.
+fn uri_host(uri: &str) -> Result<Option<&str>> {
+    let (scheme, rest) = match uri.split_once(':') {
+        Some(parts) => parts,
+        None => anyhow::bail!("invalid URI"),
+    };
     ensure!(
         !scheme.is_empty()
             && scheme.as_bytes()[0].is_ascii_alphabetic()
@@ -265,10 +283,25 @@ fn uri_host(uri: &str) -> Result<&str> {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')),
         "invalid URI scheme"
     );
+    let Some(rest) = rest.strip_prefix("//") else {
+        return Ok(None);
+    };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let authority = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
+    if authority.starts_with('[') {
+        let end = authority.find(']').context("invalid URI IP literal")?;
+        let tail = &authority[end + 1..];
+        ensure!(
+            tail.is_empty()
+                || tail
+                    .strip_prefix(':')
+                    .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit())),
+            "invalid URI port"
+        );
+        return Ok(None);
+    }
     let (host, port) = authority
         .split_once(':')
         .map_or((authority, None), |(host, port)| (host, Some(port)));
@@ -278,17 +311,87 @@ fn uri_host(uri: &str) -> Result<&str> {
             "invalid URI port"
         );
     }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Ok(None);
+    }
     validate_domain(host)?;
-    ensure!(
-        host.parse::<std::net::IpAddr>().is_err(),
-        "URI name constraint cannot authorize an IP host"
-    );
-    Ok(host)
+    Ok(Some(host))
 }
 
-// DirectoryString ASCII profiles use case/space folding across PrintableString
-// and UTF8String. Wider Unicode matching requires RFC4518 preparation; fail
-// closed rather than claim equivalence under incomplete Unicode normalization.
+/// RFC 4518 string preparation as profiled by RFC 5280 7.1 for case-ignore
+/// matching: map, case fold, NFKC, prohibit and bidirectional checks, then
+/// insignificant-space handling. Anything the profile prohibits is an error.
+fn prepare_string(text: &str) -> Result<String> {
+    let mut mapped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\u{9}'..='\u{d}'
+            | '\u{85}'
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}' => mapped.push(' '),
+            '\u{0}'..='\u{8}'
+            | '\u{e}'..='\u{1f}'
+            | '\u{7f}'..='\u{84}'
+            | '\u{86}'..='\u{9f}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{180e}'
+            | '\u{200c}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2063}'
+            | '\u{206a}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffc}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}' => {}
+            c => mapped.push(c),
+        }
+    }
+    let folded = stringprep::nameprep(&mapped)
+        .map_err(|error| anyhow::anyhow!("prohibited directory string character: {error:?}"))?;
+    // Insignificant spaces: trim, collapse internal runs, and keep one space for an empty value.
+    let collapsed = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    Ok(if collapsed.is_empty() {
+        " ".to_owned()
+    } else {
+        collapsed
+    })
+}
+
+fn directory_string_text(value: &der::asn1::Any) -> Result<String> {
+    let bytes = value.value();
+    match value.tag() {
+        Tag::Utf8String => Ok(std::str::from_utf8(bytes)?.to_owned()),
+        Tag::PrintableString | Tag::Ia5String => {
+            ensure!(bytes.is_ascii(), "non-ASCII restricted directory string");
+            Ok(std::str::from_utf8(bytes)?.to_owned())
+        }
+        // TeletexString has no unambiguous mapping beyond ASCII; fail closed.
+        Tag::TeletexString => {
+            ensure!(bytes.is_ascii(), "unsupported TeletexString repertoire");
+            Ok(std::str::from_utf8(bytes)?.to_owned())
+        }
+        Tag::BmpString => {
+            ensure!(bytes.len().is_multiple_of(2), "invalid BMPString");
+            char::decode_utf16(
+                bytes
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]])),
+            )
+            .collect::<std::result::Result<String, _>>()
+            .map_err(|_| anyhow::anyhow!("invalid BMPString"))
+        }
+        _ => anyhow::bail!("unsupported directory name attribute syntax"),
+    }
+}
+
 fn normalize_dn(name: &x509_cert::name::Name) -> Result<Vec<Vec<(String, String)>>> {
     name.0
         .iter()
@@ -297,22 +400,11 @@ fn normalize_dn(name: &x509_cert::name::Name) -> Result<Vec<Vec<(String, String)
                 .0
                 .iter()
                 .map(|attribute| {
-                    let value = &attribute.value;
-                    ensure!(
-                        matches!(
-                            value.tag(),
-                            Tag::Utf8String | Tag::PrintableString | Tag::Ia5String
-                        ),
-                        "unsupported directory name attribute syntax"
-                    );
-                    let text = std::str::from_utf8(value.value())?;
-                    ensure!(
-                        text.is_ascii() && !text.bytes().any(|byte| byte.is_ascii_control()),
-                        "unsupported international directory name constraint"
-                    );
+                    let text = directory_string_text(&attribute.value)?;
                     let oid = attribute.oid.to_string();
                     let normalized = if oid == "1.2.840.113549.1.9.1" {
-                        let (local, host) = split_mailbox(text)?;
+                        ensure!(text.is_ascii(), "unsupported international email attribute");
+                        let (local, host) = split_mailbox(&text)?;
                         format!("{local}@{}", host.to_ascii_lowercase())
                     } else {
                         ensure!(
@@ -329,6 +421,8 @@ fn normalize_dn(name: &x509_cert::name::Name) -> Result<Vec<Vec<(String, String)
                                     | "2.5.4.11"
                                     | "2.5.4.12"
                                     | "2.5.4.13"
+                                    | "2.5.4.15"
+                                    | "2.5.4.17"
                                     | "2.5.4.41"
                                     | "2.5.4.42"
                                     | "2.5.4.43"
@@ -339,10 +433,7 @@ fn normalize_dn(name: &x509_cert::name::Name) -> Result<Vec<Vec<(String, String)
                             ),
                             "unsupported directory name attribute matching rule {oid}"
                         );
-                        text.split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                            .to_ascii_lowercase()
+                        prepare_string(&text)?
                     };
                     Ok((oid, normalized))
                 })
@@ -360,15 +451,49 @@ fn same_name_form(
     std::mem::discriminant(a) == std::mem::discriminant(b)
 }
 
+/// Levels `name` lies below `base` (0 when equal), or `None` when it is not a
+/// descendant. A leading dot on `base` excludes the base itself.
+fn dns_depth(name: &str, constraint: &str) -> Result<Option<usize>> {
+    validate_domain(name)?;
+    let descendants_only = constraint.starts_with('.');
+    let base = constraint.strip_prefix('.').unwrap_or(constraint);
+    validate_domain(base)?;
+    if name.eq_ignore_ascii_case(base) {
+        return Ok((!descendants_only).then_some(0));
+    }
+    if name.len() > base.len()
+        && name.as_bytes()[name.len() - base.len() - 1] == b'.'
+        && name[name.len() - base.len()..].eq_ignore_ascii_case(base)
+    {
+        let prefix = &name[..name.len() - base.len() - 1];
+        return Ok(Some(prefix.split('.').count()));
+    }
+    Ok(None)
+}
+
+fn within_levels(
+    depth: Option<usize>,
+    subtree: &x509_cert::ext::pkix::constraints::name::GeneralSubtree,
+) -> bool {
+    depth.is_some_and(|depth| {
+        depth as u64 >= u64::from(subtree.minimum)
+            && subtree
+                .maximum
+                .is_none_or(|max| depth as u64 <= u64::from(max))
+    })
+}
+
 fn within_subtree(
     name: &x509_cert::ext::pkix::name::GeneralName,
-    base: &x509_cert::ext::pkix::name::GeneralName,
+    subtree: &x509_cert::ext::pkix::constraints::name::GeneralSubtree,
 ) -> Result<bool> {
     use x509_cert::ext::pkix::name::GeneralName;
+    let base = &subtree.base;
     match (name, base) {
-        (GeneralName::DnsName(name), GeneralName::DnsName(base)) => {
-            domain_matches(name.as_str(), base.as_str(), false)
-        }
+        (GeneralName::DnsName(name), GeneralName::DnsName(base)) => Ok(within_levels(
+            dns_depth(name.as_str(), base.as_str())?,
+            subtree,
+        )),
         (GeneralName::Rfc822Name(name), GeneralName::Rfc822Name(base)) => {
             let (local, host) = split_mailbox(name.as_str())?;
             if base.as_str().contains('@') {
@@ -381,7 +506,10 @@ fn within_subtree(
         (
             GeneralName::UniformResourceIdentifier(name),
             GeneralName::UniformResourceIdentifier(base),
-        ) => domain_matches(uri_host(name.as_str())?, base.as_str(), true),
+        ) => match uri_host(name.as_str())? {
+            Some(host) => domain_matches(host, base.as_str(), true),
+            None => Ok(false),
+        },
         (GeneralName::IpAddress(name), GeneralName::IpAddress(base)) => {
             let (name, base) = (name.as_bytes(), base.as_bytes());
             ensure!(
@@ -398,7 +526,11 @@ fn within_subtree(
                 .all(|((name, address), mask)| name & mask == address & mask))
         }
         (GeneralName::DirectoryName(name), GeneralName::DirectoryName(base)) => {
-            Ok(normalize_dn(name)?.starts_with(&normalize_dn(base)?))
+            let (name, base) = (normalize_dn(name)?, normalize_dn(base)?);
+            Ok(within_levels(
+                name.starts_with(&base).then(|| name.len() - base.len()),
+                subtree,
+            ))
         }
         _ => Ok(false),
     }
@@ -433,7 +565,7 @@ fn check_certificate_names(
         for excluded in constraints.excluded_subtrees.iter().flatten() {
             if same_name_form(&name, &excluded.base) {
                 ensure!(
-                    !within_subtree(&name, &excluded.base)?,
+                    !within_subtree(&name, excluded)?,
                     "certificate name is in excluded subtree"
                 );
             }
@@ -447,7 +579,7 @@ fn check_certificate_names(
         if !permitted.is_empty() {
             let mut matched = false;
             for subtree in permitted {
-                matched |= within_subtree(&name, &subtree.base)?;
+                matched |= within_subtree(&name, subtree)?;
             }
             ensure!(matched, "certificate name outside permitted subtrees");
         }
@@ -455,6 +587,7 @@ fn check_certificate_names(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_extensions(
     c: &Certificate,
     unix_time: u64,
@@ -463,6 +596,7 @@ fn validate_extensions(
     ca_below: usize,
     certificate_der: &[u8],
     microsoft_timestamp_compatibility: bool,
+    crl_signer: bool,
 ) -> Result<bool> {
     let t = &c.tbs_certificate;
     ensure!(
@@ -542,7 +676,9 @@ fn validate_extensions(
     }
     let basic = t.get::<BasicConstraints>()?;
     let usage = t.get::<KeyUsage>()?;
-    if leaf {
+    if leaf && crl_signer {
+        // A CRL signer may be an end entity or a CA; cRLSign is checked by the caller.
+    } else if leaf {
         ensure!(!basic.as_ref().is_some_and(|(_, b)| b.ca), "signer is a CA");
         if let Some((_, u)) = usage {
             ensure!(
@@ -563,7 +699,9 @@ fn validate_extensions(
         );
     }
     let eku_ext = t.get::<ExtendedKeyUsage>()?;
-    if leaf {
+    if crl_signer {
+        // RFC 5280 places no extended key usage requirement on CRL signers.
+    } else if leaf {
         let (_, e) = eku_ext.context("signer lacks required EKU")?;
         ensure!(
             e.0.iter().any(|v| v.to_string() == eku),
@@ -914,6 +1052,7 @@ fn search_path(
             depth.saturating_sub(1),
             bytes,
             microsoft_timestamp_compatibility,
+            options.crl_signer,
         ) {
             Ok(value) => interpreted || value,
             Err(error) => reject!(path, error),
@@ -1072,6 +1211,7 @@ pub(super) fn validate_report_constraints(
             depth == 0,
             depth.saturating_sub(1),
             bytes,
+            false,
             false,
         )?;
         if let Some((_, constraints)) = certificate

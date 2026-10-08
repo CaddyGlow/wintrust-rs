@@ -70,12 +70,14 @@ by the certificate's `cRLIssuer`, with `certificateIssuer` entries), scoped
 and delta CRLs (`deltaCRLIndicator`, newest delta wins, `removeFromCRL` releases
 only a `certificateHold`) are combined. Good status requires fresh in-scope
 evidence covering every reason; any authenticated listing is revoked. A CRL
-signer other than the certificate issuer must be directly issued by it, valid
-and `cRLSign`-capable; pinned intermediates serve as signer candidates. Longer
-CRL-signer paths, relative-to-full distribution point name conversion and
-attribute-certificate CRLs are treated as out of scope and never establish good
-status. Online acquisition also follows `freshestCRL` and records each
-artifact's URL, digest, size and source in the revocation report.
+signer other than the certificate issuer must validate to the same trust anchor
+by full path validation (any depth; no extended key usage is required) and carry
+`cRLSign`; pinned intermediates serve as signer candidates. The signer's own
+revocation status is not evaluated. Relative distribution point names resolve
+against the CRL issuer or `cRLIssuer`. CRLs limited to attribute certificates
+never apply to public-key certificates. Online acquisition also follows
+`freshestCRL`. The revocation report records every artifact's origin (online or
+policy-pinned file), location, digest, size and source.
 
 Certificate policies follow RFC 5280 6.1 through `chain::PathOptions`: policy
 tree, mappings, `policyConstraints`, `inhibitAnyPolicy`, initial policy inputs
