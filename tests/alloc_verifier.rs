@@ -4,7 +4,10 @@ fn policy() -> PortablePolicy {
     serde_json::from_slice(include_bytes!("fixtures/policy.json")).unwrap()
 }
 
-fn artifact(artifact: &wintrust::portable::ArtifactRef, _: usize) -> anyhow::Result<Vec<u8>> {
+fn artifact(
+    artifact: &wintrust::portable::ArtifactRef,
+    _: usize,
+) -> wintrust::error::Result<Vec<u8>> {
     // The reader resolves opaque locations; all fingerprints and budgets are
     // still enforced by the verifier.
     let bytes = match artifact.sha256.as_str() {
@@ -15,7 +18,7 @@ fn artifact(artifact: &wintrust::portable::ArtifactRef, _: usize) -> anyhow::Res
         hash if hash == policy().ocsp_responses[0].sha256 => {
             include_bytes!("fixtures/catalog-good.ocsp.der").as_slice()
         }
-        _ => anyhow::bail!("unexpected artifact"),
+        _ => return Err(wintrust::error::Error::configuration("unexpected artifact")),
     };
     Ok(bytes.to_vec())
 }

@@ -8,7 +8,10 @@ use x509_cert::Certificate;
 fn main() -> Result<()> {
     let path = std::env::args().nth(1).context("CATALOG_PATH")?;
     let bytes = std::fs::read(path)?;
-    let catalog = signed::verify_signed_data_with_policy(&bytes, "1.3.6.1.4.1.311.10.1", false)?;
+    let catalog = signed::verify_signed_data(
+        &bytes,
+        &signed::SignedDataOptions::new("1.3.6.1.4.1.311.10.1".parse()?),
+    )?;
     let mut output = Vec::new();
     for signer in catalog.signers {
         for (oid, values) in signer.unsigned_attributes {
@@ -17,10 +20,9 @@ fn main() -> Result<()> {
                 continue;
             }
             for token in values {
-                let cms = signed::verify_signed_data_with_policy(
+                let cms = signed::verify_signed_data(
                     &token,
-                    "1.2.840.113549.1.9.16.1.4",
-                    false,
+                    &signed::SignedDataOptions::new("1.2.840.113549.1.9.16.1.4".parse()?),
                 )?;
                 for bytes in cms.certificates {
                     let certificate = Certificate::from_der(&bytes)?;

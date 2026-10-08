@@ -1,10 +1,6 @@
 //! Shared bounded DER traversal; format-specific validation stays with callers.
 use crate::catalog::{CatalogError, CatalogLimits, bad};
-use alloc::{
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
+use alloc::{vec, vec::Vec};
 use der::{Decode, Reader, SliceReader, asn1::AnyRef};
 
 #[derive(Clone, Copy)]
@@ -39,12 +35,9 @@ pub(crate) fn tagged(n: Node<'_>, tag: u8) -> Result<Node<'_>, CatalogError> {
 pub(crate) fn field<'a>(items: &[Node<'a>], i: usize, tag: u8) -> Result<Node<'a>, CatalogError> {
     tagged(*items.get(i).ok_or_else(|| bad("missing field"))?, tag)
 }
-pub(crate) fn typed_oid(n: Node<'_>) -> Result<der::asn1::ObjectIdentifier, CatalogError> {
+pub(crate) fn oid(n: Node<'_>) -> Result<der::asn1::ObjectIdentifier, CatalogError> {
     tagged(n, 6)?;
     Ok(AnyRef::from_der(n.full)?.decode_as::<der::asn1::ObjectIdentifier>()?)
-}
-pub(crate) fn oid(n: Node<'_>) -> Result<String, CatalogError> {
-    Ok(typed_oid(n)?.to_string())
 }
 pub(crate) fn all(bytes: &[u8], max_children: usize) -> Result<Vec<Node<'_>>, CatalogError> {
     let mut rest = bytes;

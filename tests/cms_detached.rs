@@ -1,6 +1,28 @@
 // Independent CMS oracle. Requires OpenSSL on PATH; explicitly run with --ignored.
 use std::{fs, path::Path, process::Command};
-use wintrust::portable::signed::{SignedDataContent, verify_cms_signed_data};
+use wintrust::{
+    Result,
+    portable::{
+        crypto::CryptoOptions,
+        signed::{SignedDataContent, SignedDataOptions, VerifiedSignedData, verify_signed_data},
+    },
+};
+
+fn verify_cms_signed_data<'a>(
+    bytes: &'a [u8],
+    expected: &str,
+    content: SignedDataContent<'a>,
+    allow_sha1: bool,
+) -> Result<VerifiedSignedData<'a>> {
+    verify_signed_data(
+        bytes,
+        &SignedDataOptions {
+            expected_content_oid: expected.parse().unwrap(),
+            content,
+            crypto: CryptoOptions { allow_sha1 },
+        },
+    )
+}
 
 const DATA: &str = "1.2.840.113549.1.7.1";
 

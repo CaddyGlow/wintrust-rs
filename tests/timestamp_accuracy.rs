@@ -133,7 +133,7 @@ fn split_validity_roots_cannot_collectively_cover_timestamp_accuracy() {
     let mut late = root;
     late.tbs_certificate.validity.not_before = time(CENTER + 1);
     let roots = vec![support::sign(early), support::sign(late)];
-    let options = TimestampOptions::new(&roots, CENTER + 100);
+    let options = TimestampOptions::new((&roots).into(), CENTER + 100);
     assert!(timestamp::verify_timestamps(&signer, &options).is_err());
     let mut callbacks = 0;
     assert!(
@@ -150,7 +150,7 @@ fn returned_timestamp_path_spans_both_accuracy_endpoints() {
     let (leaf, root) = certificates();
     let signer = signer(&leaf);
     let roots = vec![root.to_der().unwrap()];
-    let options = TimestampOptions::new(&roots, CENTER + 100);
+    let options = TimestampOptions::new((&roots).into(), CENTER + 100);
     let report = timestamp::verify_timestamps(&signer, &options)
         .unwrap()
         .unwrap();
@@ -213,7 +213,9 @@ fn crl(issuer: &Certificate, revoked: Option<&Certificate>) -> Vec<u8> {
 fn catalog(leaf: &Certificate, tsa: &Certificate) -> Vec<u8> {
     let source = wintrust::portable::signed::verify_signed_data(
         include_bytes!("fixtures/catalog.cat"),
-        "1.3.6.1.4.1.311.10.1",
+        &wintrust::portable::signed::SignedDataOptions::new(
+            "1.3.6.1.4.1.311.10.1".parse().unwrap(),
+        ),
     )
     .unwrap();
     let content = source.content_der;
@@ -226,7 +228,7 @@ fn catalog(leaf: &Certificate, tsa: &Certificate) -> Vec<u8> {
     let signature: Signature = support::key().sign(&tlv(0x31, &attrs.concat()));
     let signature = signature.to_der();
     let unsigned = attribute(
-        timestamp::RFC3161_ATTRIBUTE,
+        &timestamp::RFC3161_ATTRIBUTE.to_string(),
         token(tsa, signature.as_bytes()),
     );
     let signer = seq(&[
@@ -280,8 +282,8 @@ fn verifier_retries_tsa_paths_when_first_intermediate_is_revoked() {
         .map(|cert| cert.to_der().unwrap())
         .collect::<Vec<_>>();
     let roots = vec![root.to_der().unwrap()];
-    let mut options = TimestampOptions::new(&roots, CENTER + 100);
-    options.issuer_candidates = &issuer_candidates;
+    let mut options = TimestampOptions::new((&roots).into(), CENTER + 100);
+    options.issuer_candidates = (&issuer_candidates).into();
     let without_revocation = timestamp::verify_timestamps(&signer(&tsa), &options)
         .unwrap()
         .unwrap();
@@ -295,7 +297,7 @@ fn verifier_retries_tsa_paths_when_first_intermediate_is_revoked() {
         crl(&alternatives[0], None),
     ];
     let reference = |index: usize| ArtifactRef {
-        path: format!("artifact-{index}").into(),
+        path: format!("artifact-{index}"),
         sha256: hex::encode(Sha256::digest(&artifacts[index])),
     };
     let mut policy: PortablePolicy =

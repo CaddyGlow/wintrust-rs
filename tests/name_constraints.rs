@@ -73,7 +73,7 @@ fn path(names: Vec<GeneralName>, nc: NameConstraints) -> (Vec<u8>, Vec<u8>) {
 }
 fn accepts(names: Vec<GeneralName>, nc: NameConstraints) -> bool {
     let (leaf, root) = path(names, nc);
-    chain::validate(&leaf, &[], &[root], TIME, EKU).is_ok()
+    chain::validate(&leaf, &support::chain_options(&[], &[root], TIME, EKU)).is_ok()
 }
 
 #[test]
@@ -228,9 +228,21 @@ fn directory_names_match_rdn_prefix_with_ascii_space_and_case_folding() {
             constraints(vec![permitted], vec![]).to_der().unwrap(),
             true,
         ));
-    assert!(chain::validate(&sign(leaf.clone()), &[], &[sign(root.clone())], TIME, EKU).is_ok());
+    assert!(
+        chain::validate(
+            &sign(leaf.clone()),
+            &support::chain_options(&[], &[sign(root.clone())], TIME, EKU)
+        )
+        .is_ok()
+    );
     leaf.tbs_certificate.subject = "CN=Signer,O=Other,C=US".parse().unwrap();
-    assert!(chain::validate(&sign(leaf), &[], &[sign(root)], TIME, EKU).is_err());
+    assert!(
+        chain::validate(
+            &sign(leaf),
+            &support::chain_options(&[], &[sign(root)], TIME, EKU)
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -274,7 +286,13 @@ fn malformed_unsupported_and_leaf_constraints_fail_closed() {
                 .unwrap(),
             true,
         ));
-    assert!(chain::validate(&sign(leaf), &[], &[sign(root)], TIME, EKU).is_err());
+    assert!(
+        chain::validate(
+            &sign(leaf),
+            &support::chain_options(&[], &[sign(root)], TIME, EKU)
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -299,8 +317,18 @@ fn constraints_are_path_local_and_an_alternative_root_can_succeed() {
             true,
         ));
     let allowed = sign(allowed);
-    assert!(chain::validate(&leaf, &[], std::slice::from_ref(&denied), TIME, EKU).is_err());
-    let selected = chain::validate(&leaf, &[], &[denied, allowed.clone()], TIME, EKU).unwrap();
+    assert!(
+        chain::validate(
+            &leaf,
+            &support::chain_options(&[], std::slice::from_ref(&denied), TIME, EKU)
+        )
+        .is_err()
+    );
+    let selected = chain::validate(
+        &leaf,
+        &support::chain_options(&[], &[denied, allowed.clone()], TIME, EKU),
+    )
+    .unwrap();
     assert_eq!(selected.chain_der.last().unwrap(), &allowed);
 }
 
@@ -355,10 +383,12 @@ fn issuer_permitted_unions_intersect_and_exclusions_accumulate() {
         assert_eq!(
             chain::validate(
                 &sign(leaf),
-                std::slice::from_ref(&issuer),
-                std::slice::from_ref(&root),
-                TIME,
-                EKU
+                &support::chain_options(
+                    std::slice::from_ref(&issuer),
+                    std::slice::from_ref(&root),
+                    TIME,
+                    EKU
+                )
             )
             .is_ok(),
             expected
@@ -420,14 +450,18 @@ fn self_issued_intermediate_names_are_exempt_but_its_constraints_still_apply() {
     let rollover = sign(rollover);
     let accepted = chain::validate_with_path_policy(
         &sign(leaf.clone()),
-        std::slice::from_ref(&rollover),
-        std::slice::from_ref(&root),
-        TIME,
-        EKU,
-        false,
-        chain::PathLimits::default(),
+        &chain::ChainOptions {
+            allow_sha1: false,
+            limits: chain::PathLimits::default(),
+            ..support::chain_options(
+                std::slice::from_ref(&rollover),
+                std::slice::from_ref(&root),
+                TIME,
+                EKU,
+            )
+        },
         |path| {
-            anyhow::ensure!(path.chain_der.len() == 3, "require rollover path");
+            support::require_policy(path.chain_der.len() == 3, "require rollover path")?;
             Ok(())
         },
     )
@@ -452,14 +486,13 @@ fn self_issued_intermediate_names_are_exempt_but_its_constraints_still_apply() {
     assert!(
         chain::validate_with_path_policy(
             &sign(leaf),
-            &[rollover],
-            &[root],
-            TIME,
-            EKU,
-            false,
-            chain::PathLimits::default(),
+            &chain::ChainOptions {
+                allow_sha1: false,
+                limits: chain::PathLimits::default(),
+                ..support::chain_options(&[rollover], &[root], TIME, EKU)
+            },
             |path| {
-                anyhow::ensure!(path.chain_der.len() == 3, "require rollover path");
+                support::require_policy(path.chain_der.len() == 3, "require rollover path")?;
                 Ok(())
             }
         )
@@ -491,7 +524,13 @@ fn legacy_subject_email_is_constrained_when_san_is_absent() {
                 .unwrap(),
             true,
         ));
-    assert!(chain::validate(&sign(leaf.clone()), &[], &[sign(root.clone())], TIME, EKU).is_err());
+    assert!(
+        chain::validate(
+            &sign(leaf.clone()),
+            &support::chain_options(&[], &[sign(root.clone())], TIME, EKU)
+        )
+        .is_err()
+    );
     leaf.tbs_certificate
         .extensions
         .as_mut()
@@ -503,7 +542,13 @@ fn legacy_subject_email_is_constrained_when_san_is_absent() {
                 .unwrap(),
             false,
         ));
-    assert!(chain::validate(&sign(leaf), &[], &[sign(root)], TIME, EKU).is_ok());
+    assert!(
+        chain::validate(
+            &sign(leaf),
+            &support::chain_options(&[], &[sign(root)], TIME, EKU)
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -599,7 +644,7 @@ fn openssl_agrees_on_supported_name_constraint_outcomes() {
             String::from_utf8_lossy(&result.stderr)
         );
         assert_eq!(
-            chain::validate(&leaf, &[], &[root], TIME, EKU).is_ok(),
+            chain::validate(&leaf, &support::chain_options(&[], &[root], TIME, EKU)).is_ok(),
             expected
         );
     }
@@ -665,7 +710,11 @@ fn directory_name_minimum_and_maximum_count_rdns_below_the_base() {
             .as_mut()
             .unwrap()
             .push(extension("2.5.29.30", nc.to_der().unwrap(), true));
-        chain::validate(&sign(leaf), &[], &[sign(root)], TIME, EKU).is_ok()
+        chain::validate(
+            &sign(leaf),
+            &support::chain_options(&[], &[sign(root)], TIME, EKU),
+        )
+        .is_ok()
     };
     assert!(run("O=Example,C=US", 0, Some(0)));
     assert!(!run("O=Example,C=US", 1, None));
@@ -732,7 +781,11 @@ fn dn_accepts(permitted: Name, subject: Name) -> bool {
                 .unwrap(),
             true,
         ));
-    chain::validate(&sign(leaf), &[], &[sign(root)], TIME, EKU).is_ok()
+    chain::validate(
+        &sign(leaf),
+        &support::chain_options(&[], &[sign(root)], TIME, EKU),
+    )
+    .is_ok()
 }
 fn text(tag: der::Tag, bytes: &[u8]) -> der::Any {
     der::Any::new(tag, bytes.to_vec()).unwrap()

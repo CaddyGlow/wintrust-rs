@@ -1,11 +1,11 @@
 //! RFC 5280 name-constraint normalization and matching.
+use crate::error::{Context, Error, Result, bail, ensure};
 use alloc::{
     borrow::ToOwned,
     format,
     string::{String, ToString},
     vec::Vec,
 };
-use anyhow::{Context, Result, ensure};
 use der::{Tag, Tagged};
 use x509_cert::Certificate;
 
@@ -18,7 +18,7 @@ pub(super) fn validate_name_constraints(
     use x509_cert::ext::pkix::name::GeneralName;
     ensure!(
         value.permitted_subtrees.is_some() || value.excluded_subtrees.is_some(),
-        "empty name constraints"
+        Error::malformed("empty name constraints")
     );
     for subtrees in [&value.permitted_subtrees, &value.excluded_subtrees]
         .into_iter()
@@ -26,7 +26,7 @@ pub(super) fn validate_name_constraints(
     {
         ensure!(
             !subtrees.is_empty() && subtrees.len() <= 256,
-            "name constraint subtree count limit"
+            Error::resource_limit("name constraint subtree count limit")
         );
         for subtree in subtrees {
             // RFC 5280 4.2.1.10: other values must be processed or rejected. Level
@@ -37,7 +37,7 @@ pub(super) fn validate_name_constraints(
                         subtree.base,
                         GeneralName::DnsName(_) | GeneralName::DirectoryName(_)
                     ),
-                    "unsupported name constraint minimum/maximum"
+                    Error::unsupported("unsupported name constraint minimum/maximum")
                 );
                 ensure!(
                     subtree.maximum.is_none_or(|max| max >= subtree.minimum),
@@ -59,7 +59,7 @@ pub(super) fn validate_name_constraints(
                     let bytes = bytes.as_bytes();
                     ensure!(
                         matches!(bytes.len(), 8 | 32),
-                        "invalid IP name constraint length"
+                        Error::malformed("invalid IP name constraint length")
                     );
                     let half = bytes.len() / 2;
                     let mut zero = false;
@@ -68,16 +68,24 @@ pub(super) fn validate_name_constraints(
                             if byte & (1 << bit) == 0 {
                                 zero = true;
                             } else {
-                                ensure!(!zero, "unsupported non-contiguous IP constraint mask");
+                                ensure!(
+                                    !zero,
+                                    Error::unsupported(
+                                        "unsupported non-contiguous IP constraint mask"
+                                    )
+                                );
                             }
                         }
                     }
                 }
                 GeneralName::DirectoryName(name) => {
-                    ensure!(!name.0.is_empty(), "empty directory name constraint");
+                    ensure!(
+                        !name.0.is_empty(),
+                        Error::malformed("empty directory name constraint")
+                    );
                     normalize_dn(name)?;
                 }
-                _ => anyhow::bail!("unsupported name constraint form"),
+                _ => bail!(Error::unsupported("unsupported name constraint form")),
             }
         }
     }
@@ -87,7 +95,7 @@ pub(super) fn validate_name_constraints(
 fn validate_domain(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty() && name.len() <= 253,
-        "invalid constrained domain length"
+        Error::malformed("invalid constrained domain length")
     );
     for label in name.split('.') {
         ensure!(
@@ -98,7 +106,7 @@ fn validate_domain(name: &str) -> Result<()> {
                 && label
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
-            "invalid constrained domain label"
+            Error::malformed("invalid constrained domain label")
         );
     }
     Ok(())
@@ -129,7 +137,7 @@ fn split_mailbox(mailbox: &str) -> Result<(&str, &str)> {
             && local
                 .bytes()
                 .all(|byte| byte.is_ascii() && !byte.is_ascii_control() && byte != b'@'),
-        "unsupported constrained mailbox local part"
+        Error::unsupported("unsupported constrained mailbox local part")
     );
     validate_domain(host)?;
     Ok((local, host))
@@ -141,7 +149,7 @@ fn split_mailbox(mailbox: &str) -> Result<(&str, &str)> {
 fn uri_host(uri: &str) -> Result<Option<&str>> {
     let (scheme, rest) = match uri.split_once(':') {
         Some(parts) => parts,
-        None => anyhow::bail!("invalid URI"),
+        None => bail!(Error::malformed("invalid URI")),
     };
     ensure!(
         !scheme.is_empty()
@@ -149,7 +157,7 @@ fn uri_host(uri: &str) -> Result<Option<&str>> {
             && scheme
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')),
-        "invalid URI scheme"
+        Error::malformed("invalid URI scheme")
     );
     let Some(rest) = rest.strip_prefix("//") else {
         return Ok(None);
@@ -166,7 +174,7 @@ fn uri_host(uri: &str) -> Result<Option<&str>> {
                 || tail
                     .strip_prefix(':')
                     .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit())),
-            "invalid URI port"
+            Error::malformed("invalid URI port")
         );
         return Ok(None);
     }
@@ -176,7 +184,7 @@ fn uri_host(uri: &str) -> Result<Option<&str>> {
     if let Some(port) = port {
         ensure!(
             !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()),
-            "invalid URI port"
+            Error::malformed("invalid URI port")
         );
     }
     if host.parse::<core::net::Ipv4Addr>().is_ok() {
@@ -222,8 +230,9 @@ fn prepare_string(text: &str) -> Result<String> {
             c => mapped.push(c),
         }
     }
-    let folded = crate::stringprep::nameprep(&mapped)
-        .map_err(|error| anyhow::anyhow!("prohibited directory string character: {error:?}"))?;
+    let folded = crate::stringprep::nameprep(&mapped).map_err(|error| {
+        Error::policy(format!("prohibited directory string character: {error:?}"))
+    })?;
     // Insignificant spaces: trim, collapse internal runs, and keep one space for an empty value.
     let collapsed = folded.split_whitespace().collect::<Vec<_>>().join(" ");
     Ok(if collapsed.is_empty() {
@@ -243,20 +252,28 @@ fn directory_string_text(value: &der::asn1::Any) -> Result<String> {
         }
         // TeletexString has no unambiguous mapping beyond ASCII; fail closed.
         Tag::TeletexString => {
-            ensure!(bytes.is_ascii(), "unsupported TeletexString repertoire");
+            ensure!(
+                bytes.is_ascii(),
+                Error::unsupported("unsupported TeletexString repertoire")
+            );
             Ok(core::str::from_utf8(bytes)?.to_owned())
         }
         Tag::BmpString => {
-            ensure!(bytes.len().is_multiple_of(2), "invalid BMPString");
+            ensure!(
+                bytes.len().is_multiple_of(2),
+                Error::malformed("invalid BMPString")
+            );
             char::decode_utf16(
                 bytes
                     .chunks_exact(2)
                     .map(|pair| u16::from_be_bytes([pair[0], pair[1]])),
             )
             .collect::<core::result::Result<String, _>>()
-            .map_err(|_| anyhow::anyhow!("invalid BMPString"))
+            .map_err(|_| Error::malformed("invalid BMPString"))
         }
-        _ => anyhow::bail!("unsupported directory name attribute syntax"),
+        _ => bail!(Error::unsupported(
+            "unsupported directory name attribute syntax"
+        )),
     }
 }
 
@@ -271,7 +288,10 @@ fn normalize_dn(name: &x509_cert::name::Name) -> Result<Vec<Vec<(String, String)
                     let text = directory_string_text(&attribute.value)?;
                     let oid = attribute.oid.to_string();
                     let normalized = if oid == "1.2.840.113549.1.9.1" {
-                        ensure!(text.is_ascii(), "unsupported international email attribute");
+                        ensure!(
+                            text.is_ascii(),
+                            Error::unsupported("unsupported international email attribute")
+                        );
                         let (local, host) = split_mailbox(&text)?;
                         format!("{local}@{}", host.to_ascii_lowercase())
                     } else {
@@ -299,7 +319,9 @@ fn normalize_dn(name: &x509_cert::name::Name) -> Result<Vec<Vec<(String, String)
                                     | "2.5.4.65"
                                     | "0.9.2342.19200300.100.1.25"
                             ),
-                            "unsupported directory name attribute matching rule {oid}"
+                            Error::unsupported(format!(
+                                "unsupported directory name attribute matching rule {oid}"
+                            ))
                         );
                         prepare_string(&text)?
                     };
@@ -382,7 +404,7 @@ fn within_subtree(
             let (name, base) = (name.as_bytes(), base.as_bytes());
             ensure!(
                 matches!(name.len(), 4 | 16),
-                "invalid subject IP address length"
+                Error::malformed("invalid subject IP address length")
             );
             if base.len() != name.len() * 2 {
                 return Ok(false);
@@ -413,11 +435,14 @@ pub(super) fn check_certificate_names(
     let san = certificate
         .tbs_certificate
         .get::<SubjectAltName>()
-        .map_err(anyhow::Error::msg)?;
+        .map_err(Error::malformed)?;
     let mut names = san
         .as_ref()
         .map_or_else(Vec::new, |(_, names)| names.0.clone());
-    ensure!(names.len() <= 256, "subject alternative name count limit");
+    ensure!(
+        names.len() <= 256,
+        Error::resource_limit("subject alternative name count limit")
+    );
     if !subject.0.is_empty() {
         names.push(GeneralName::DirectoryName(subject.clone()));
     }
@@ -429,7 +454,7 @@ pub(super) fn check_certificate_names(
                         attribute
                             .value
                             .decode_as::<der::asn1::Ia5String>()
-                            .map_err(anyhow::Error::msg)?,
+                            .map_err(Error::malformed)?,
                     ));
                 }
             }

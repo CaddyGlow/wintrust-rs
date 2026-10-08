@@ -1,5 +1,6 @@
 //! Authenticated timestamp binding. A signed signingTime alone is not a timestamp.
 use super::{chain, crypto, signed};
+use crate::error::{Context, Result, bail, ensure};
 use alloc::{
     borrow::ToOwned,
     format,
@@ -7,23 +8,37 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use anyhow::{Context, Result, bail, ensure};
-use der::{Decode, asn1::AnyRef};
-use serde::Serialize;
+use der::{
+    Decode,
+    asn1::{AnyRef, ObjectIdentifier},
+};
+use serde::{Deserialize, Serialize};
 use x509_cert::Certificate;
 
-pub const RFC3161_ATTRIBUTE: &str = "1.2.840.113549.1.9.16.2.14";
-pub const MICROSOFT_RFC3161_ATTRIBUTE: &str = "1.3.6.1.4.1.311.3.3.1";
-pub const COUNTERSIGNATURE_ATTRIBUTE: &str = "1.2.840.113549.1.9.6";
-const TST_INFO: &str = "1.2.840.113549.1.9.16.1.4";
-const TSA_EKU: &str = "1.3.6.1.5.5.7.3.8";
-const SIGNING_TIME: &str = "1.2.840.113549.1.9.5";
+pub const RFC3161_ATTRIBUTE: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.14");
+pub const MICROSOFT_RFC3161_ATTRIBUTE: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.3.3.1");
+pub const COUNTERSIGNATURE_ATTRIBUTE: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.6");
+const TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
+const TSA_EKU: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
+const SIGNING_TIME: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.5");
 
 type TimestampPathPolicy<'a> = dyn FnMut(&chain::ChainReport, u64) -> Result<()> + 'a;
 
+/// Authenticated timestamp encoding, serialized with stable report names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimestampFormat {
+    #[serde(rename = "rfc3161")]
+    Rfc3161,
+    #[serde(rename = "legacy_countersignature")]
+    LegacyCountersignature,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TimestampReport {
-    pub format: String,
+    pub format: TimestampFormat,
     pub unix_time: u64,
     pub accuracy_seconds: u64,
     pub tsa_certificate_sha256: String,
@@ -41,30 +56,36 @@ fn fields(n: Node<'_>) -> Result<Vec<Node<'_>>> {
     Ok(crate::der::all(n.value, 128)?)
 }
 fn integer(n: Node<'_>) -> Result<u64> {
-    ensure!(n.tag == 2, "expected INTEGER");
+    ensure!(
+        n.tag == 2,
+        crate::error::Error::malformed("expected INTEGER")
+    );
     AnyRef::from_der(n.full)
-        .map_err(anyhow::Error::msg)?
+        .map_err(crate::error::Error::malformed)?
         .decode_as::<u64>()
-        .map_err(anyhow::Error::msg)
+        .map_err(crate::error::Error::malformed)
 }
 fn implicit_integer(n: Node<'_>) -> Result<u64> {
     let mut der = n.full.to_vec();
     der[0] = 2;
     AnyRef::from_der(&der)
-        .map_err(anyhow::Error::msg)?
+        .map_err(crate::error::Error::malformed)?
         .decode_as::<u64>()
-        .map_err(anyhow::Error::msg)
+        .map_err(crate::error::Error::malformed)
 }
 fn time(n: Node<'_>) -> Result<u64> {
     if n.tag == 0x17 {
         return Ok(AnyRef::from_der(n.full)
-            .map_err(anyhow::Error::msg)?
+            .map_err(crate::error::Error::malformed)?
             .decode_as::<der::asn1::UtcTime>()
-            .map_err(anyhow::Error::msg)?
+            .map_err(crate::error::Error::malformed)?
             .to_unix_duration()
             .as_secs());
     }
-    ensure!(n.tag == 0x18, "expected generalized time");
+    ensure!(
+        n.tag == 0x18,
+        crate::error::Error::malformed("expected generalized time")
+    );
     // RFC3161 allows fractional seconds. Require DER UTC encoding and validate
     // the calendar with der's DateTime after removing the fractional component.
     let value = core::str::from_utf8(n.value)?;
@@ -77,24 +98,27 @@ fn time(n: Node<'_>) -> Result<u64> {
                     && fraction.len() <= 9
                     && fraction.bytes().all(|b| b.is_ascii_digit())
                     && !fraction.ends_with('0'),
-                "noncanonical fractional timestamp"
+                crate::error::Error::malformed("noncanonical fractional timestamp")
             );
             format!("{base}Z")
         } else {
             value.to_owned()
         };
-    ensure!(calendar.len() == 15, "invalid generalized time");
+    ensure!(
+        calendar.len() == 15,
+        crate::error::Error::malformed("invalid generalized time")
+    );
     let mut encoded = vec![0x18, 15];
     encoded.extend_from_slice(calendar.as_bytes());
     Ok(AnyRef::from_der(&encoded)
-        .map_err(anyhow::Error::msg)?
+        .map_err(crate::error::Error::malformed)?
         .decode_as::<der::asn1::GeneralizedTime>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(crate::error::Error::malformed)?
         .to_unix_duration()
         .as_secs())
 }
 fn require_tsa(der: &[u8], rfc3161: bool, noncritical_tsa_pins: &[String]) -> Result<bool> {
-    let cert = Certificate::from_der(der).map_err(anyhow::Error::msg)?;
+    let cert = Certificate::from_der(der).map_err(crate::error::Error::malformed)?;
     let extensions = cert
         .tbs_certificate
         .extensions
@@ -104,18 +128,24 @@ fn require_tsa(der: &[u8], rfc3161: bool, noncritical_tsa_pins: &[String]) -> Re
         .iter()
         .filter(|e| e.extn_id.to_string() == "2.5.29.37")
         .collect();
-    ensure!(eku.len() == 1, "timestamp EKU must be unique");
-    let purposes = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(eku[0].extn_value.as_bytes())
-        .map_err(anyhow::Error::msg)?;
     ensure!(
-        purposes.0.iter().any(|p| p.to_string() == TSA_EKU),
+        eku.len() == 1,
+        crate::error::Error::malformed("timestamp EKU must be unique")
+    );
+    let purposes = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(eku[0].extn_value.as_bytes())
+        .map_err(crate::error::Error::malformed)?;
+    ensure!(
+        purposes.0.contains(&TSA_EKU),
         "timestamp signer must have TSA EKU"
     );
     let compatibility_used = rfc3161
         && !eku[0].critical
         && purposes.0.len() == 1
-        && noncritical_tsa_pins
-            .contains(&hex::encode(crypto::digest("2.16.840.1.101.3.4.2.1", der)?));
+        && noncritical_tsa_pins.contains(&hex::encode(crypto::digest(
+            ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
+            der,
+            &crypto::CryptoOptions::default(),
+        )?));
     if rfc3161 {
         ensure!(
             purposes.0.len() == 1 && (eku[0].critical || compatibility_used),
@@ -135,22 +165,22 @@ fn require_tsa(der: &[u8], rfc3161: bool, noncritical_tsa_pins: &[String]) -> Re
 /// only the supplied roots can anchor trust. The evaluation clock is required.
 #[derive(Debug, Clone)]
 pub struct TimestampOptions<'a> {
-    pub roots: &'a [Vec<u8>],
-    pub issuer_candidates: &'a [Vec<u8>],
+    pub roots: super::CertificateStore<'a>,
+    pub issuer_candidates: super::CertificateStore<'a>,
     pub evaluation_time: u64,
-    pub allow_sha1: bool,
+    pub crypto: crypto::CryptoOptions,
     pub path_limits: chain::PathLimits,
     /// Exact Microsoft TSA leaf fingerprints permitting a sole noncritical TSA EKU.
     pub noncritical_tsa_certificate_sha256: &'a [String],
 }
 
 impl<'a> TimestampOptions<'a> {
-    pub fn new(roots: &'a [Vec<u8>], evaluation_time: u64) -> Self {
+    pub fn new(roots: super::CertificateStore<'a>, evaluation_time: u64) -> Self {
         Self {
             roots,
-            issuer_candidates: &[],
+            issuer_candidates: super::CertificateStore::default(),
             evaluation_time,
-            allow_sha1: false,
+            crypto: crypto::CryptoOptions::default(),
             path_limits: chain::PathLimits::default(),
             noncritical_tsa_certificate_sha256: &[],
         }
@@ -175,47 +205,83 @@ fn verify_rfc3161_inner(
 ) -> Result<TimestampReport> {
     let roots = options.roots;
     let now = options.evaluation_time;
-    let allow_sha1 = options.allow_sha1;
+    let allow_sha1 = options.crypto.allow_sha1;
     let noncritical_tsa_pins = options.noncritical_tsa_certificate_sha256;
     let issuer_candidates = options.issuer_candidates;
-    ensure!(token.len() <= 4 * 1024 * 1024, "timestamp byte limit");
-    let mut cms = signed::verify_signed_data_with_policy(token, TST_INFO, allow_sha1)?;
-    cms.certificates.extend_from_slice(issuer_candidates);
+    ensure!(
+        token.len() <= 4 * 1024 * 1024,
+        crate::error::Error::resource_limit("timestamp byte limit")
+    );
+    ensure!(
+        original_signature.len() <= 16 * 1024,
+        crate::error::Error::resource_limit("timestamp imprint target byte limit")
+    );
+    let cms = signed::verify_signed_data(
+        token,
+        &signed::SignedDataOptions {
+            crypto: options.crypto,
+            ..signed::SignedDataOptions::new(TST_INFO)
+        },
+    )?;
+    ensure!(
+        cms.certificates
+            .len()
+            .checked_add(issuer_candidates.len())
+            .and_then(|count| count.checked_add(roots.len()))
+            .is_some_and(|count| count <= options.path_limits.max_store_certificates),
+        crate::error::Error::resource_limit("timestamp certificate store count limit")
+    );
+    let certificate_bytes = cms
+        .certificates
+        .iter()
+        .map(Vec::as_slice)
+        .chain(issuer_candidates.iter())
+        .collect::<Vec<_>>();
+    let candidates = super::CertificateStore::from(certificate_bytes.as_slice());
     ensure!(cms.signers.len() == 1, "timestamp requires one signer");
     let (tst, size) = node(cms.content_value)?;
     ensure!(
         size == cms.content_value.len() && tst.tag == 0x30,
-        "invalid TSTInfo"
+        crate::error::Error::malformed("invalid TSTInfo")
     );
     let f = fields(tst)?;
-    ensure!(f.len() >= 5, "truncated TSTInfo");
-    ensure!(integer(f[0])? == 1, "unsupported TSTInfo version");
+    ensure!(
+        f.len() >= 5,
+        crate::error::Error::malformed("truncated TSTInfo")
+    );
+    ensure!(
+        integer(f[0])? == 1,
+        crate::error::Error::unsupported("unsupported TSTInfo version")
+    );
     oid(f[1])?;
-    ensure!(f[2].tag == 0x30, "invalid message imprint");
+    ensure!(
+        f[2].tag == 0x30,
+        crate::error::Error::malformed("invalid message imprint")
+    );
     let imprint = fields(f[2])?;
     ensure!(
         imprint.len() == 2 && imprint[0].tag == 0x30 && imprint[1].tag == 4,
-        "invalid message imprint"
+        crate::error::Error::malformed("invalid message imprint")
     );
     let alg = fields(imprint[0])?;
     ensure!(
         !alg.is_empty() && alg.len() <= 2,
-        "invalid imprint algorithm"
+        crate::error::Error::malformed("invalid imprint algorithm")
     );
     if let Some(parameters) = alg.get(1) {
         ensure!(
             parameters.tag == 5 && parameters.value.is_empty(),
-            "unsupported timestamp imprint parameters"
+            crate::error::Error::unsupported("unsupported timestamp imprint parameters")
         );
     }
-    let digest = crypto::digest_with_policy(&oid(alg[0])?, original_signature, allow_sha1)?;
+    let digest = crypto::digest(oid(alg[0])?, original_signature, &options.crypto)?;
     ensure!(
         digest == imprint[1].value,
-        "timestamp is not bound to original signature"
+        crate::error::Error::signature("timestamp is not bound to original signature")
     );
     ensure!(
         f[3].tag == 2 && !f[3].value.is_empty() && f[3].value[0] & 0x80 == 0,
-        "invalid timestamp serial"
+        crate::error::Error::malformed("invalid timestamp serial")
     );
     let unix_time = time(f[4])?;
     ensure!(unix_time <= now, "timestamp is in future");
@@ -229,9 +295,12 @@ fn verify_rfc3161_inner(
                 2 => 1,
                 0x80 => 2,
                 0x81 => 3,
-                _ => bail!("invalid timestamp accuracy"),
+                _ => bail!(crate::error::Error::malformed("invalid timestamp accuracy")),
             };
-            ensure!(rank > previous, "duplicate or unordered accuracy");
+            ensure!(
+                rank > previous,
+                crate::error::Error::malformed("duplicate or unordered accuracy")
+            );
             previous = rank;
             if n.tag == 2 {
                 accuracy = integer(n)?;
@@ -239,7 +308,7 @@ fn verify_rfc3161_inner(
                 let v = implicit_integer(n)?;
                 ensure!(
                     (1..=999).contains(&v),
-                    "invalid timestamp fractional accuracy"
+                    crate::error::Error::malformed("invalid timestamp fractional accuracy")
                 );
                 accuracy = accuracy.checked_add(1).context("accuracy overflow")?;
             }
@@ -247,13 +316,16 @@ fn verify_rfc3161_inner(
         pos += 1;
     }
     if f.get(pos).is_some_and(|n| n.tag == 1) {
-        ensure!(f[pos].value == [0xff], "noncanonical timestamp ordering");
+        ensure!(
+            f[pos].value == [0xff],
+            crate::error::Error::malformed("noncanonical timestamp ordering")
+        );
         pos += 1;
     }
     if f.get(pos).is_some_and(|n| n.tag == 2) {
         ensure!(
             f[pos].value.first().is_some_and(|b| b & 0x80 == 0),
-            "invalid nonce"
+            crate::error::Error::malformed("invalid nonce")
         );
         pos += 1;
     }
@@ -264,9 +336,10 @@ fn verify_rfc3161_inner(
         let names = fields(f[pos])?;
         ensure!(
             names.len() == 1 && names[0].tag == 0xa4,
-            "unsupported TSA name form"
+            crate::error::Error::unsupported("unsupported TSA name form")
         );
-        let cert = Certificate::from_der(&signer.certificate_der).map_err(anyhow::Error::msg)?;
+        let cert = Certificate::from_der(&signer.certificate_der)
+            .map_err(crate::error::Error::malformed)?;
         use der::Encode;
         ensure!(
             names[0].value
@@ -274,12 +347,15 @@ fn verify_rfc3161_inner(
                     .tbs_certificate
                     .subject
                     .to_der()
-                    .map_err(anyhow::Error::msg)?,
+                    .map_err(crate::error::Error::malformed)?,
             "TSA name does not match signer"
         );
         pos += 1;
     }
-    ensure!(pos == f.len(), "unsupported timestamp extensions or fields");
+    ensure!(
+        pos == f.len(),
+        crate::error::Error::unsupported("unsupported timestamp extensions or fields")
+    );
     // Cover subsecond rounding and signed accuracy, not only the center point.
     let bound = accuracy
         .checked_add(u64::from(f[4].value.contains(&b'.')))
@@ -293,7 +369,7 @@ fn verify_rfc3161_inner(
     ensure!(end <= now, "timestamp uncertainty extends into future");
     let path = chain::validate_timestamp_path(
         &signer.certificate_der,
-        &cms.certificates,
+        candidates,
         roots,
         end,
         start,
@@ -303,12 +379,13 @@ fn verify_rfc3161_inner(
         |path| accept_path(path, unix_time),
     )?;
     Ok(TimestampReport {
-        format: "rfc3161".into(),
+        format: TimestampFormat::Rfc3161,
         unix_time,
         accuracy_seconds: bound,
         tsa_certificate_sha256: hex::encode(crypto::digest(
-            "2.16.840.1.101.3.4.2.1",
+            ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
             &signer.certificate_der,
+            &crypto::CryptoOptions::default(),
         )?),
         tsa_anchor_sha256: path.anchor_sha256,
         noncritical_tsa_compatibility_used: compatibility_used,
@@ -335,36 +412,38 @@ fn verify_legacy_inner(
 ) -> Result<TimestampReport> {
     ensure!(
         counter.len() <= 4 * 1024 * 1024,
-        "countersignature byte limit"
+        crate::error::Error::resource_limit("countersignature byte limit")
     );
     let certificates = options.issuer_candidates;
     let roots = options.roots;
     let now = options.evaluation_time;
-    let allow_sha1 = options.allow_sha1;
-    let signer = signed::verify_counter_signer_with_policy(
-        counter,
-        original_signature,
-        certificates,
-        allow_sha1,
-    )?;
+    let allow_sha1 = options.crypto.allow_sha1;
+    let signer =
+        signed::verify_counter_signer(counter, original_signature, certificates, &options.crypto)?;
     require_tsa(&signer.certificate_der, false, &[])?;
     let (n, size) = node(counter)?;
     ensure!(
         n.tag == 0x30 && size == counter.len(),
-        "invalid countersignature"
+        crate::error::Error::malformed("invalid countersignature")
     );
     let f = fields(n)?;
     let attrs = f
         .get(3)
         .context("missing countersignature signed attributes")?;
-    ensure!(attrs.tag == 0xa0, "missing signed countersignature time");
+    ensure!(
+        attrs.tag == 0xa0,
+        crate::error::Error::malformed("missing signed countersignature time")
+    );
     let mut times = Vec::new();
     for a in fields(*attrs)? {
-        ensure!(a.tag == 0x30, "invalid counter attribute");
+        ensure!(
+            a.tag == 0x30,
+            crate::error::Error::malformed("invalid counter attribute")
+        );
         let af = fields(a)?;
         ensure!(
             af.len() == 2 && af[1].tag == 0x31,
-            "invalid counter attribute"
+            crate::error::Error::malformed("invalid counter attribute")
         );
         if oid(af[0])? == SIGNING_TIME {
             let values = fields(af[1])?;
@@ -373,27 +452,29 @@ fn verify_legacy_inner(
         }
     }
     ensure!(
-        times.len() == 1 && times[0] <= now,
-        "missing, ambiguous or future countersignature time"
+        times.len() == 1,
+        crate::error::Error::malformed("missing or ambiguous countersignature time")
     );
+    ensure!(times[0] <= now, "future countersignature time");
     let unix_time = times[0];
     let path = chain::validate_with_path_policy(
         &signer.certificate_der,
-        certificates,
-        roots,
-        unix_time,
-        TSA_EKU,
-        allow_sha1,
-        options.path_limits,
+        &chain::ChainOptions {
+            candidates: certificates,
+            allow_sha1,
+            limits: options.path_limits,
+            ..chain::ChainOptions::new(roots, unix_time, TSA_EKU)
+        },
         |path| accept_path(path, unix_time),
     )?;
     Ok(TimestampReport {
-        format: "legacy_countersignature".into(),
+        format: TimestampFormat::LegacyCountersignature,
         unix_time,
         accuracy_seconds: 0,
         tsa_certificate_sha256: hex::encode(crypto::digest(
-            "2.16.840.1.101.3.4.2.1",
+            ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
             &signer.certificate_der,
+            &crypto::CryptoOptions::default(),
         )?),
         tsa_anchor_sha256: path.anchor_sha256,
         noncritical_tsa_compatibility_used: false,
@@ -420,8 +501,8 @@ pub fn verify_timestamps_with_path_policy(
 ) -> Result<Option<TimestampReport>> {
     let mut timestamp = None;
     for (oid, values) in &signer.unsigned_attributes {
-        let rfc3161 = oid == RFC3161_ATTRIBUTE || oid == MICROSOFT_RFC3161_ATTRIBUTE;
-        let legacy = oid == COUNTERSIGNATURE_ATTRIBUTE;
+        let rfc3161 = *oid == RFC3161_ATTRIBUTE || *oid == MICROSOFT_RFC3161_ATTRIBUTE;
+        let legacy = *oid == COUNTERSIGNATURE_ATTRIBUTE;
         if !rfc3161 && !legacy {
             continue;
         }
@@ -446,7 +527,8 @@ fn verify_ess(signer: &signed::VerifiedSigner) -> Result<()> {
         .signed_attributes
         .iter()
         .filter(|(oid, _)| {
-            oid == "1.2.840.113549.1.9.16.2.12" || oid == "1.2.840.113549.1.9.16.2.47"
+            *oid == ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.12")
+                || *oid == ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.47")
         })
         .collect();
     ensure!(
@@ -456,52 +538,70 @@ fn verify_ess(signer: &signed::VerifiedSigner) -> Result<()> {
     let (n, size) = node(&attributes[0].1[0])?;
     ensure!(
         n.tag == 0x30 && size == attributes[0].1[0].len(),
-        "invalid SigningCertificate"
+        crate::error::Error::malformed("invalid SigningCertificate")
     );
     let outer = fields(n)?;
     ensure!(
         !outer.is_empty() && outer.len() <= 2 && outer[0].tag == 0x30,
-        "invalid ESS certs"
+        crate::error::Error::malformed("invalid ESS certs")
     );
     let certs = fields(outer[0])?;
     ensure!(
         !certs.is_empty() && certs.len() <= 64 && certs[0].tag == 0x30,
-        "invalid ESS certificate list"
+        crate::error::Error::malformed("invalid ESS certificate list")
     );
     let f = fields(certs[0])?;
     let mut pos = 0;
-    let mut digest = if attributes[0].0 == "1.2.840.113549.1.9.16.2.12" {
-        "1.3.14.3.2.26".to_owned()
-    } else {
-        "2.16.840.1.101.3.4.2.1".to_owned()
-    };
-    if attributes[0].0 == "1.2.840.113549.1.9.16.2.47" && f.first().is_some_and(|n| n.tag == 0x30) {
+    let mut digest =
+        if attributes[0].0 == ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.12") {
+            ObjectIdentifier::new_unwrap("1.3.14.3.2.26")
+        } else {
+            ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1")
+        };
+    if attributes[0].0 == ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.47")
+        && f.first().is_some_and(|n| n.tag == 0x30)
+    {
         let a = fields(f[0])?;
-        ensure!(!a.is_empty() && a.len() <= 2, "invalid ESS algorithm");
+        ensure!(
+            !a.is_empty() && a.len() <= 2,
+            crate::error::Error::malformed("invalid ESS algorithm")
+        );
         if let Some(parameters) = a.get(1) {
             ensure!(
                 parameters.tag == 5 && parameters.value.is_empty(),
-                "unsupported ESS digest parameters"
+                crate::error::Error::unsupported("unsupported ESS digest parameters")
             );
         }
         digest = oid(a[0])?;
         pos += 1;
     }
     let h = f.get(pos).context("missing ESS certificate hash")?;
-    ensure!(h.tag == 4, "invalid ESS certificate hash");
     ensure!(
-        h.value == crypto::digest_with_policy(&digest, &signer.certificate_der, true)?,
-        "ESS certificate binding mismatch"
+        h.tag == 4,
+        crate::error::Error::malformed("invalid ESS certificate hash")
+    );
+    ensure!(
+        h.value
+            == crypto::digest(
+                digest,
+                &signer.certificate_der,
+                &crypto::CryptoOptions { allow_sha1: true }
+            )?,
+        crate::error::Error::signature("ESS certificate binding mismatch")
     );
     pos += 1;
     if let Some(serial) = f.get(pos) {
-        ensure!(serial.tag == 0x30, "invalid ESS issuerSerial");
+        ensure!(
+            serial.tag == 0x30,
+            crate::error::Error::malformed("invalid ESS issuerSerial")
+        );
         let sf = fields(*serial)?;
         ensure!(
             sf.len() == 2 && sf[0].tag == 0x30 && sf[1].tag == 2,
-            "invalid ESS issuerSerial"
+            crate::error::Error::malformed("invalid ESS issuerSerial")
         );
-        let cert = Certificate::from_der(&signer.certificate_der).map_err(anyhow::Error::msg)?;
+        let cert = Certificate::from_der(&signer.certificate_der)
+            .map_err(crate::error::Error::malformed)?;
         use der::Encode;
         ensure!(
             sf[1].full
@@ -509,7 +609,7 @@ fn verify_ess(signer: &signed::VerifiedSigner) -> Result<()> {
                     .tbs_certificate
                     .serial_number
                     .to_der()
-                    .map_err(anyhow::Error::msg)?,
+                    .map_err(crate::error::Error::malformed)?,
             "ESS serial mismatch"
         );
         let names = fields(sf[0])?;
@@ -521,12 +621,15 @@ fn verify_ess(signer: &signed::VerifiedSigner) -> Result<()> {
                         .tbs_certificate
                         .issuer
                         .to_der()
-                        .map_err(anyhow::Error::msg)?,
+                        .map_err(crate::error::Error::malformed)?,
             "ESS issuer mismatch"
         );
         pos += 1;
     }
-    ensure!(pos == f.len(), "unexpected ESS certificate fields");
+    ensure!(
+        pos == f.len(),
+        crate::error::Error::malformed("unexpected ESS certificate fields")
+    );
     Ok(())
 }
 
@@ -539,7 +642,7 @@ mod tests {
     fn pinned_noncritical_tsa_still_rejects_mixed_or_duplicate_ekus() {
         let mut certificate =
             Certificate::from_der(include_bytes!("../../../tests/fixtures/root.der")).unwrap();
-        let purposes = x509_cert::ext::pkix::ExtendedKeyUsage(vec![TSA_EKU.parse().unwrap()]);
+        let purposes = x509_cert::ext::pkix::ExtendedKeyUsage(vec![TSA_EKU]);
         let extensions = certificate.tbs_certificate.extensions.as_mut().unwrap();
         extensions.retain(|e| e.extn_id.to_string() != "2.5.29.37");
         extensions.push(x509_cert::ext::Extension {
@@ -549,7 +652,14 @@ mod tests {
         });
         // This test checks the isolated EKU policy, not certificate signatures.
         let original = certificate.to_der().unwrap();
-        let pin = hex::encode(crypto::digest("2.16.840.1.101.3.4.2.1", &original).unwrap());
+        let pin = hex::encode(
+            crypto::digest(
+                ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
+                &original,
+                &crypto::CryptoOptions::default(),
+            )
+            .unwrap(),
+        );
         assert!(require_tsa(&original, true, &[pin]).unwrap());
         assert!(require_tsa(&original, true, &[]).is_err());
         let mut certificate = Certificate::from_der(&original).unwrap();
@@ -563,7 +673,14 @@ mod tests {
         purposes.0.push("1.3.6.1.5.5.7.3.3".parse().unwrap());
         eku.extn_value = der::asn1::OctetString::new(purposes.to_der().unwrap()).unwrap();
         let mixed = certificate.to_der().unwrap();
-        let pin = hex::encode(crypto::digest("2.16.840.1.101.3.4.2.1", &mixed).unwrap());
+        let pin = hex::encode(
+            crypto::digest(
+                ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
+                &mixed,
+                &crypto::CryptoOptions::default(),
+            )
+            .unwrap(),
+        );
         assert!(require_tsa(&mixed, true, &[pin]).is_err());
         let mut certificate = Certificate::from_der(&original).unwrap();
         let extensions = certificate.tbs_certificate.extensions.as_mut().unwrap();
@@ -574,7 +691,14 @@ mod tests {
             .clone();
         extensions.push(eku);
         let duplicate = certificate.to_der().unwrap();
-        let pin = hex::encode(crypto::digest("2.16.840.1.101.3.4.2.1", &duplicate).unwrap());
+        let pin = hex::encode(
+            crypto::digest(
+                ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
+                &duplicate,
+                &crypto::CryptoOptions::default(),
+            )
+            .unwrap(),
+        );
         assert!(require_tsa(&duplicate, true, &[pin]).is_err());
     }
 }

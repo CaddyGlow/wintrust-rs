@@ -37,7 +37,11 @@ fn real_public_ctl_crypto_and_optional_attributes_preserve_metadata() {
         ),
     ] {
         assert_eq!(hex::encode(Sha256::digest(bytes)), hash);
-        let verified = signed::verify_signed_data(bytes, "1.3.6.1.4.1.311.10.1").unwrap();
+        let verified = signed::verify_signed_data(
+            bytes,
+            &signed::SignedDataOptions::new("1.3.6.1.4.1.311.10.1".parse().unwrap()),
+        )
+        .unwrap();
         assert_eq!(verified.signers.len(), 1);
         let cert = x509_cert::Certificate::from_der(&verified.signers[0].certificate_der).unwrap();
         let eku = cert
@@ -94,9 +98,9 @@ fn independently_pinned_bootstrap_and_current_vs_historical_authentication() {
     );
     let roots = vec![ROOT.to_vec()];
     let policy = CtlAuthenticationPolicy {
-        bootstrap_anchors: &roots,
-        issuer_candidates: &[],
-        required_signer_eku: "1.3.6.1.4.1.311.10.3.9",
+        bootstrap_anchors: (&roots).into(),
+        issuer_candidates: Default::default(),
+        required_signer_eku: "1.3.6.1.4.1.311.10.3.9".parse().unwrap(),
         required_list_usage: "1.3.6.1.4.1.311.10.3.9".parse().unwrap(),
         verification_time: NOW,
         minimum_sequence: None,
@@ -107,7 +111,7 @@ fn independently_pinned_bootstrap_and_current_vs_historical_authentication() {
     assert_eq!(auth.inspect().unwrap().entries.len(), 562);
     assert_eq!(auth.signer_paths()[0].chain_der.last().unwrap(), ROOT);
     let no_bootstrap = CtlAuthenticationPolicy {
-        bootstrap_anchors: &[],
+        bootstrap_anchors: Default::default(),
         ..policy
     };
     assert!(ctl::authenticate(authroot.as_slice(), &no_bootstrap, Default::default()).is_err());
@@ -176,7 +180,11 @@ fn openssl_verifies_exact_public_ctl_signatures() {
             String::from_utf8_lossy(&result.stderr)
         );
         assert!(String::from_utf8_lossy(&result.stderr).contains("Verification successful"));
-        let verified = signed::verify_signed_data(bytes, "1.3.6.1.4.1.311.10.1").unwrap();
+        let verified = signed::verify_signed_data(
+            bytes,
+            &signed::SignedDataOptions::new("1.3.6.1.4.1.311.10.1".parse().unwrap()),
+        )
+        .unwrap();
         let output = std::fs::read(tmp.path().join("content.der")).unwrap();
         assert!(output == verified.content_der || output == verified.content_value);
     }

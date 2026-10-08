@@ -1,6 +1,6 @@
 [package]
 name = "wintrust"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -19,6 +19,7 @@ include = [
   "/tests/support/**",
   "/tests/api.rs",
   "/tests/alloc_verifier.rs",
+  "/tests/public_api.rs",
   "/tests/chain_alternatives.rs",
   "/tests/cms_detached.rs",
   "/tests/crl_evaluation.rs",
@@ -44,7 +45,7 @@ description = "Portable Rust catalog trust with Windows API name aliases"
 [features]
 default = []
 std = [
-  "anyhow/std", "serde/std", "serde_json/std", "sha1/std", "sha2/std",
+  "serde/std", "serde_json/std", "sha1/std", "sha2/std",
   "hex/std", "der/std", "der/pem", "x509-cert/pem", "x509-cert/std",
   "x509-ocsp/std", "rsa/std", "p256/std", "p384/std", "signature/std",
   "roxmltree/std", "dep:libc",
@@ -54,7 +55,6 @@ online = ["std", "dep:reqwest"]
 
 [dependencies]
 hexspell = { package = "caddy-hexspell", version = "1.1.1", default-features = false }
-anyhow = { version = "1.0", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 sha1 = { version = "0.10", default-features = false, features = ["oid"] }
@@ -78,6 +78,7 @@ unicode-normalization = { version = "0.1", default-features = false }
 unicode-properties = "0.1"
 
 [dev-dependencies]
+anyhow = "1.0"
 tempfile = "3.23"
 p256 = { version = "0.13", default-features = false, features = ["pem"] }
 der = { version = "0.7", default-features = false, features = ["pem"] }

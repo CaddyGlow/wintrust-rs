@@ -9,10 +9,10 @@ fn fixture(name: &str) -> PathBuf {
 fn policy() -> PortablePolicy {
     serde_json::from_slice(&std::fs::read(fixture("policy.json")).unwrap()).unwrap()
 }
-fn verifier(policy: PortablePolicy) -> anyhow::Result<Verifier> {
+fn verifier(policy: PortablePolicy) -> wintrust::Result<Verifier> {
     Verifier::from_policy(policy, &fixture(""), PortableLimits::default())
 }
-fn verify(engine: &Verifier) -> anyhow::Result<wintrust::portable::PortableTrustReport> {
+fn verify(engine: &Verifier) -> wintrust::Result<wintrust::portable::PortableTrustReport> {
     engine.verify_catalog_member(
         &fixture("catalog.cat"),
         &fixture("member.manifest"),

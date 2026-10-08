@@ -9,7 +9,7 @@ use x509_cert::Certificate;
 fn fixture() -> (Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let cms = signed::verify_signed_data(
         include_bytes!("fixtures/catalog.cat"),
-        "1.3.6.1.4.1.311.10.1",
+        &signed::SignedDataOptions::new("1.3.6.1.4.1.311.10.1".parse().unwrap()),
     )
     .unwrap();
     (
@@ -33,18 +33,17 @@ fn alternative_same_key_issuer_does_not_make_a_valid_path_ambiguous() {
     assert!(
         chain::validate(
             &leaf,
-            &certs,
-            std::slice::from_ref(&invalid_anchor),
-            TIME,
-            EKU
+            &support::chain_options(&certs, std::slice::from_ref(&invalid_anchor), TIME, EKU)
         )
         .is_err()
     );
     certs.push(invalid_anchor.clone());
     let anchors = vec![invalid_anchor, roots[0].clone()];
-    let expected = chain::validate(&leaf, &certs, &anchors, TIME, EKU).unwrap();
+    let expected =
+        chain::validate(&leaf, &support::chain_options(&certs, &anchors, TIME, EKU)).unwrap();
     certs.reverse();
-    let reordered = chain::validate(&leaf, &certs, &anchors, TIME, EKU).unwrap();
+    let reordered =
+        chain::validate(&leaf, &support::chain_options(&certs, &anchors, TIME, EKU)).unwrap();
     assert_eq!(expected.chain_der, reordered.chain_der);
     assert_eq!(expected.chain_der.last().unwrap(), &roots[0]);
 }
@@ -60,7 +59,11 @@ fn large_store_is_independent_of_path_work_limits() {
         anchors.push(root.to_der().unwrap());
     }
     let candidates = certs.iter().cycle().take(100).cloned().collect::<Vec<_>>();
-    chain::validate(&leaf, &candidates, &anchors, TIME, EKU).unwrap();
+    chain::validate(
+        &leaf,
+        &support::chain_options(&candidates, &anchors, TIME, EKU),
+    )
+    .unwrap();
     for limits in [
         PathLimits {
             max_store_certificates: 1,
@@ -84,7 +87,15 @@ fn large_store_is_independent_of_path_work_limits() {
         },
     ] {
         assert!(
-            chain::validate_with_limits(&leaf, &certs, &roots, TIME, EKU, false, limits).is_err()
+            chain::validate(
+                &leaf,
+                &chain::ChainOptions {
+                    allow_sha1: false,
+                    limits,
+                    ..support::chain_options(&certs, &roots, TIME, EKU)
+                }
+            )
+            .is_err()
         );
     }
 }
@@ -92,7 +103,13 @@ fn large_store_is_independent_of_path_work_limits() {
 #[test]
 fn unsupported_constraints_and_wrong_purpose_still_fail() {
     let (leaf, certs, roots) = fixture();
-    assert!(chain::validate(&leaf, &certs, &roots, TIME, "1.2.3.4").is_err());
+    assert!(
+        chain::validate(
+            &leaf,
+            &support::chain_options(&certs, &roots, TIME, "1.2.3.4")
+        )
+        .is_err()
+    );
     let mut signer = Certificate::from_der(&leaf).unwrap();
     signer
         .tbs_certificate
@@ -104,7 +121,11 @@ fn unsupported_constraints_and_wrong_purpose_still_fail() {
             critical: false,
             extn_value: der::asn1::OctetString::new(vec![0x30, 0]).unwrap(),
         });
-    let error = chain::validate(&signer.to_der().unwrap(), &certs, &roots, TIME, EKU).unwrap_err();
+    let error = chain::validate(
+        &signer.to_der().unwrap(),
+        &support::chain_options(&certs, &roots, TIME, EKU),
+    )
+    .unwrap_err();
     assert!(format!("{error:#}").contains("unsupported certificate constraint"));
 }
 
@@ -124,22 +145,21 @@ fn signed_alternatives() -> (Vec<u8>, Vec<Vec<u8>>) {
 #[test]
 fn path_policy_rejection_searches_another_fully_authenticated_anchor() {
     let (leaf, roots) = signed_alternatives();
-    let first = chain::validate(&leaf, &[], &roots, TIME, EKU).unwrap();
+    let first = chain::validate(&leaf, &support::chain_options(&[], &roots, TIME, EKU)).unwrap();
     let mut inspected = Vec::new();
     let accepted = chain::validate_with_path_policy(
         &leaf,
-        &[],
-        &roots,
-        TIME,
-        EKU,
-        false,
-        PathLimits::default(),
+        &chain::ChainOptions {
+            allow_sha1: false,
+            limits: PathLimits::default(),
+            ..support::chain_options(&[], &roots, TIME, EKU)
+        },
         |path| {
             inspected.push(path.anchor_sha256.clone());
-            anyhow::ensure!(
+            support::require_policy(
                 path.anchor_sha256 != first.anchor_sha256,
-                "distrusted anchor"
-            );
+                "distrusted anchor",
+            )?;
             Ok(())
         },
     )
@@ -148,23 +168,24 @@ fn path_policy_rejection_searches_another_fully_authenticated_anchor() {
     assert_ne!(accepted.anchor_sha256, first.anchor_sha256);
     let error = chain::validate_with_path_policy(
         &leaf,
-        &[],
-        &roots,
-        TIME,
-        EKU,
-        false,
-        PathLimits::default(),
-        |_| anyhow::bail!("revoked path"),
+        &chain::ChainOptions {
+            allow_sha1: false,
+            limits: PathLimits::default(),
+            ..support::chain_options(&[], &roots, TIME, EKU)
+        },
+        |_| Err(wintrust::error::Error::policy("revoked path")),
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains("revoked path"));
     assert!(
         chain::validate(
             &leaf,
-            &[],
-            &[include_bytes!("fixtures/root.der").to_vec()],
-            TIME,
-            EKU
+            &support::chain_options(
+                &[],
+                &[include_bytes!("fixtures/root.der").to_vec()],
+                TIME,
+                EKU
+            )
         )
         .is_err()
     );
@@ -174,16 +195,15 @@ fn path_policy_rejection_searches_another_fully_authenticated_anchor() {
 fn untrusted_same_key_issuer_cycles_terminate_without_establishing_trust() {
     let (leaf, candidates) = signed_alternatives();
     let anchors = vec![include_bytes!("fixtures/root.der").to_vec()];
-    let error = chain::validate_with_limits(
+    let error = chain::validate(
         &leaf,
-        &candidates,
-        &anchors,
-        TIME,
-        EKU,
-        false,
-        PathLimits {
-            max_explored_candidates: 8,
-            ..PathLimits::default()
+        &chain::ChainOptions {
+            allow_sha1: false,
+            limits: PathLimits {
+                max_explored_candidates: 8,
+                ..PathLimits::default()
+            },
+            ..support::chain_options(&candidates, &anchors, TIME, EKU)
         },
     )
     .unwrap_err();
@@ -259,15 +279,65 @@ fn self_issued_rollover_is_exempt_from_path_length_but_other_cas_are_not() {
         leaf.tbs_certificate.issuer = issuer.tbs_certificate.subject.clone();
         let result = chain::validate(
             &sign(leaf, &new_key),
-            &[sign(issuer, &old_key)],
-            &roots,
-            TIME,
-            EKU,
+            &support::chain_options(&[sign(issuer, &old_key)], &roots, TIME, EKU),
         );
         if self_issued {
             assert_eq!(result.unwrap().chain_der.len(), 3);
         } else {
             assert!(format!("{:#}", result.unwrap_err()).contains("CA path length exceeded"));
         }
+    }
+}
+
+#[test]
+fn borrowed_der_store_has_the_same_trust_and_typed_limits() {
+    let (leaf, candidates, roots) = fixture();
+    let candidate_slices = candidates.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let root_slices = roots.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut options = chain::ChainOptions::new(root_slices.as_slice(), TIME, EKU.parse().unwrap());
+    options.candidates = candidate_slices.as_slice().into();
+    let borrowed = chain::validate(&leaf, &options).unwrap();
+    let owned = chain::validate(
+        &leaf,
+        &support::chain_options(&candidates, &roots, TIME, EKU),
+    )
+    .unwrap();
+    assert_eq!(borrowed.chain_der, owned.chain_der);
+    options.limits.max_store_bytes = 1;
+    assert!(matches!(
+        chain::validate(&leaf, &options),
+        Err(wintrust::error::Error::ResourceLimit(_))
+    ));
+    options.roots = Default::default();
+    assert!(matches!(
+        chain::validate(&leaf, &options),
+        Err(wintrust::error::Error::InvalidConfiguration(_))
+    ));
+}
+
+#[test]
+fn absent_required_purpose_or_ca_permissions_are_policy_rejections() {
+    for (leaf_oid, root_oid) in [
+        (Some("2.5.29.37"), None),
+        (None, Some("2.5.29.19")),
+        (None, Some("2.5.29.15")),
+    ] {
+        let (mut leaf, mut root) = support::templates(&["2.5.29.35", "2.5.29.14"]);
+        for (certificate, removed) in [(&mut leaf, leaf_oid), (&mut root, root_oid)] {
+            if let Some(oid) = removed {
+                certificate
+                    .tbs_certificate
+                    .extensions
+                    .as_mut()
+                    .unwrap()
+                    .retain(|extension| extension.extn_id != oid.parse().unwrap());
+            }
+        }
+        let roots = [support::sign(root)];
+        let options = chain::ChainOptions::new(&roots, TIME, EKU.parse().unwrap());
+        assert!(matches!(
+            chain::validate(&support::sign(leaf), &options),
+            Err(wintrust::error::Error::PolicyRejected(_))
+        ));
     }
 }

@@ -45,7 +45,9 @@ pub fn sign(certificate: Certificate) -> Vec<u8> {
 pub fn templates(remove: &[&str]) -> (Certificate, Certificate) {
     let cms = wintrust::portable::signed::verify_signed_data(
         include_bytes!("../fixtures/catalog.cat"),
-        "1.3.6.1.4.1.311.10.1",
+        &wintrust::portable::signed::SignedDataOptions::new(
+            "1.3.6.1.4.1.311.10.1".parse().unwrap(),
+        ),
     )
     .unwrap();
     (
@@ -58,4 +60,24 @@ pub fn templates(remove: &[&str]) -> (Certificate, Certificate) {
             remove,
         ),
     )
+}
+
+/// Explicit owned-buffer view used by synthetic path scenarios.
+pub fn chain_options<'a>(
+    candidates: &'a [Vec<u8>],
+    roots: &'a [Vec<u8>],
+    time: u64,
+    eku: &str,
+) -> wintrust::portable::chain::ChainOptions<'a> {
+    let mut options =
+        wintrust::portable::chain::ChainOptions::new(roots, time, eku.parse().unwrap());
+    options.candidates = candidates.into();
+    options
+}
+pub fn require_policy(condition: bool, message: &str) -> wintrust::error::Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(wintrust::error::Error::policy(message))
+    }
 }

@@ -7,6 +7,7 @@
 //! authenticated listing of the certificate is `Revoked` regardless of
 //! freshness. Everything else is `Unknown`.
 use super::{RevocationLimits, RevocationStatus, extensions_supported, fresh, verify_signature};
+use crate::error::{Context, Error, Result, bail, ensure};
 use alloc::{
     borrow::ToOwned,
     collections::BTreeSet,
@@ -15,7 +16,6 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use anyhow::{Context, Result, bail, ensure};
 use core::cmp::Ordering;
 use der::{Decode, Encode, asn1::Uint};
 use x509_cert::{
@@ -82,7 +82,7 @@ fn compare_numbers(a: &[u8], b: &[u8]) -> Ordering {
 
 fn authority_matches(aki_der: &[u8], signer: &Certificate) -> Result<bool> {
     let aki = x509_cert::ext::pkix::AuthorityKeyIdentifier::from_der(aki_der)
-        .map_err(anyhow::Error::msg)?;
+        .map_err(Error::malformed)?;
     ensure!(
         aki.authority_cert_issuer.is_some() == aki.authority_cert_serial_number.is_some(),
         "CRL authority issuer/serial must appear together"
@@ -97,7 +97,7 @@ fn authority_matches(aki_der: &[u8], signer: &Certificate) -> Result<bool> {
         let Some((_, ski)) = signer
             .tbs_certificate
             .get::<SubjectKeyIdentifier>()
-            .map_err(anyhow::Error::msg)?
+            .map_err(Error::malformed)?
         else {
             return Ok(false);
         };
@@ -124,30 +124,26 @@ fn authorize_signer(
     now: u64,
     limits: RevocationLimits,
 ) -> Result<()> {
-    use super::super::chain::{self, PathLimits, PathOptions};
+    use super::super::chain;
     let anchor = ancestry.last().context("CRL signer path has no anchor")?;
     let mut intermediates = Vec::new();
     for certificate in ancestry[..ancestry.len() - 1].iter().chain(pool) {
         if certificate != candidate {
-            intermediates.push(certificate.to_der().map_err(anyhow::Error::msg)?);
+            intermediates.push(certificate.to_der().map_err(Error::malformed)?);
         }
     }
-    chain::validate_with_options(
-        &candidate.to_der().map_err(anyhow::Error::msg)?,
-        &intermediates,
-        &[anchor.to_der().map_err(anyhow::Error::msg)?],
+    let roots = [anchor.to_der().map_err(Error::malformed)?];
+    let mut options = super::super::chain::ChainOptions::new(
+        &roots,
         now,
-        "",
-        limits.allow_sha1,
-        PathLimits::default(),
-        &PathOptions {
-            crl_signer: true,
-            ..PathOptions::default()
-        },
-        |_| Ok(()),
-    )
-    .map(drop)
-    .context("CRL signer does not chain to the trust anchor")
+        "2.5.29.37.0".parse().map_err(Error::malformed)?,
+    );
+    options.candidates = (&intermediates).into();
+    options.allow_sha1 = limits.allow_sha1;
+    options.path.crl_signer = true;
+    chain::validate(&candidate.to_der().map_err(Error::malformed)?, &options)
+        .map(drop)
+        .context("CRL signer does not chain to the trust anchor")
 }
 
 fn authenticate(
@@ -157,13 +153,16 @@ fn authenticate(
     now: u64,
     limits: RevocationLimits,
 ) -> Result<AuthenticatedCrl> {
-    ensure!(bytes.len() <= limits.max_artifact_bytes, "CRL byte limit");
+    ensure!(
+        bytes.len() <= limits.max_artifact_bytes,
+        Error::resource_limit("CRL byte limit")
+    );
     let issuer = ancestry.first().context("CRL certificate issuer missing")?;
-    let list = CertificateList::from_der(bytes).map_err(anyhow::Error::msg)?;
+    let list = CertificateList::from_der(bytes).map_err(Error::malformed)?;
     let tbs = &list.tbs_cert_list;
     ensure!(
         tbs.signature == list.signature_algorithm,
-        "CRL signature algorithm mismatch"
+        Error::malformed("CRL signature algorithm mismatch")
     );
     let extensions = tbs.crl_extensions.as_deref();
     if extensions.is_some() {
@@ -187,19 +186,18 @@ fn authenticate(
         match id.as_str() {
             OID_CRL_NUMBER => {
                 ensure!(!extension.critical, "critical CRL number");
-                crl_number = Some(number(&Uint::from_der(value).map_err(anyhow::Error::msg)?));
+                crl_number = Some(number(&Uint::from_der(value).map_err(Error::malformed)?));
             }
             OID_DELTA_INDICATOR => {
                 ensure!(extension.critical, "deltaCRLIndicator must be critical");
-                base_number = Some(number(&Uint::from_der(value).map_err(anyhow::Error::msg)?));
+                base_number = Some(number(&Uint::from_der(value).map_err(Error::malformed)?));
             }
             OID_ISSUING_DISTRIBUTION_POINT => {
                 ensure!(
                     extension.critical,
                     "issuingDistributionPoint must be critical"
                 );
-                let point =
-                    IssuingDistributionPoint::from_der(value).map_err(anyhow::Error::msg)?;
+                let point = IssuingDistributionPoint::from_der(value).map_err(Error::malformed)?;
                 ensure!(
                     u8::from(point.only_contains_user_certs)
                         + u8::from(point.only_contains_ca_certs)
@@ -228,12 +226,12 @@ fn authenticate(
         .signature
         .as_bytes()
         .context("unaligned CRL signature")?;
-    let message = tbs.to_der().map_err(anyhow::Error::msg)?;
+    let message = tbs.to_der().map_err(Error::malformed)?;
     let algorithm = list
         .signature_algorithm
         .to_der()
-        .map_err(anyhow::Error::msg)?;
-    let mut last_error = anyhow::anyhow!("no CRL signing certificate for the CRL issuer");
+        .map_err(Error::malformed)?;
+    let mut last_error = Error::signature("no CRL signing certificate for the CRL issuer");
     for (position, candidate) in core::iter::once(issuer).chain(signers).enumerate() {
         if candidate.tbs_certificate.subject != tbs.issuer {
             continue;
@@ -242,8 +240,8 @@ fn authenticate(
             let usage = candidate
                 .tbs_certificate
                 .get::<KeyUsage>()
-                .map_err(anyhow::Error::msg)?
-                .context("CRL signer keyUsage missing")?;
+                .map_err(Error::malformed)?
+                .ok_or_else(|| Error::policy("CRL signer keyUsage missing"))?;
             ensure!(usage.1.crl_sign(), "CRL signer lacks cRLSign usage");
             if position > 0 && candidate != issuer {
                 authorize_signer(candidate, ancestry, signers, now, limits)?;
@@ -251,7 +249,7 @@ fn authenticate(
             if let Some(aki) = &aki_der {
                 ensure!(
                     authority_matches(aki, candidate)?,
-                    "CRL authority key identifier mismatch"
+                    Error::malformed("CRL authority key identifier mismatch")
                 );
             }
             verify_signature(
@@ -307,7 +305,10 @@ fn lookup(
         .revoked_certificates
         .as_deref()
         .unwrap_or_default();
-    ensure!(entries.len() <= limits.max_entries, "CRL entry limit");
+    ensure!(
+        entries.len() <= limits.max_entries,
+        Error::resource_limit("CRL entry limit")
+    );
     let indirect = crl.idp.as_ref().is_some_and(|idp| idp.indirect_crl);
     let mut current_issuer = crl.issuer().clone();
     let mut seen = BTreeSet::new();
@@ -322,26 +323,26 @@ fn lookup(
                     ensure!(indirect, "certificateIssuer in a CRL that is not indirect");
                     ensure!(extension.critical, "certificateIssuer must be critical");
                     let names = Vec::<GeneralName>::from_der(extension.extn_value.as_bytes())
-                        .map_err(anyhow::Error::msg)?;
+                        .map_err(Error::malformed)?;
                     match names.as_slice() {
                         [GeneralName::DirectoryName(name)] => current_issuer = name.clone(),
-                        _ => bail!("unsupported certificateIssuer form"),
+                        _ => bail!(Error::unsupported("unsupported certificateIssuer form")),
                     }
                 }
                 OID_CRL_REASON => {
                     ensure!(!extension.critical, "critical CRL reason code");
                     reason = CrlReason::from_der(extension.extn_value.as_bytes())
-                        .map_err(anyhow::Error::msg)?;
+                        .map_err(Error::malformed)?;
                 }
                 _ => {}
             }
         }
         ensure!(
             seen.insert((
-                current_issuer.to_der().map_err(anyhow::Error::msg)?,
+                current_issuer.to_der().map_err(Error::malformed)?,
                 entry.serial_number.as_bytes().to_vec()
             )),
-            "duplicate CRL serial"
+            Error::malformed("duplicate CRL serial")
         );
         ensure!(
             entry.revocation_date.to_unix_duration().as_secs() <= now,
@@ -505,7 +506,7 @@ pub(super) fn evaluate(
     let issuer = ancestry.first().context("CRL certificate issuer missing")?;
     ensure!(
         certificate.tbs_certificate.issuer == issuer.tbs_certificate.subject,
-        "CRL certificate issuer mismatch"
+        Error::malformed("CRL certificate issuer mismatch")
     );
     let mut diagnostics = Vec::new();
     let mut parsed = Vec::new();
@@ -518,7 +519,7 @@ pub(super) fn evaluate(
     let points = match certificate
         .tbs_certificate
         .get::<CrlDistributionPoints>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
     {
         Some((_, points)) => {
             ensure!(
@@ -536,7 +537,7 @@ pub(super) fn evaluate(
     let is_ca = certificate
         .tbs_certificate
         .get::<BasicConstraints>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
         .is_some_and(|(_, constraints)| constraints.ca);
     // Per-CRL: whether it is bound to the issuer and the reasons it covers.
     let mut bindings = Vec::new();
@@ -673,7 +674,7 @@ pub(super) fn evaluate(
 /// Parsing only: nothing here authenticates the CRL.
 pub(super) fn locations(bytes: &[u8]) -> Result<(bool, Vec<String>)> {
     use x509_cert::ext::pkix::FreshestCrl;
-    let list = CertificateList::from_der(bytes).map_err(anyhow::Error::msg)?;
+    let list = CertificateList::from_der(bytes).map_err(Error::malformed)?;
     let mut delta = false;
     let mut out = Vec::new();
     for extension in list.tbs_cert_list.crl_extensions.iter().flatten() {
@@ -681,7 +682,7 @@ pub(super) fn locations(bytes: &[u8]) -> Result<(bool, Vec<String>)> {
             OID_DELTA_INDICATOR => delta = true,
             "2.5.29.46" => {
                 let points = FreshestCrl::from_der(extension.extn_value.as_bytes())
-                    .map_err(anyhow::Error::msg)?;
+                    .map_err(Error::malformed)?;
                 ensure!(points.0.len() <= 64, "freshestCRL point count");
                 for point in &points.0 {
                     if let Some(DistributionPointName::FullName(names)) = &point.distribution_point

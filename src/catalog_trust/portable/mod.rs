@@ -12,10 +12,14 @@ pub mod signed;
 pub mod sip;
 pub mod timestamp;
 
+pub use crate::CertificateStore;
+use crate::ObjectIdentifier;
+use crate::error::{Context, Error, Result, ensure};
 use alloc::{string::String, vec::Vec};
-use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "online")]
+use std::time::Instant;
 #[cfg(feature = "std")]
 use std::{
     fs::OpenOptions,
@@ -24,20 +28,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// An artifact location. Filesystem paths with `std`, opaque identifiers otherwise.
-#[cfg(feature = "std")]
-pub type ArtifactPath = PathBuf;
-#[cfg(not(feature = "std"))]
-pub type ArtifactPath = String;
-
-#[cfg(feature = "online")]
-use std::time::Instant;
-
-/// Explicit artifact binding; relative paths resolve beside the policy file.
+/// Hash-pinned artifact location. The identifier is opaque to an injected reader;
+/// filesystem adapters resolve it relative to the policy directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
-    pub path: ArtifactPath,
+    pub path: String,
     pub sha256: String,
 }
 
@@ -169,7 +165,7 @@ pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
         .read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() <= limit,
-        "input exceeds portable verification byte limit"
+        Error::resource_limit("input exceeds portable verification byte limit")
     );
     Ok(bytes)
 }
@@ -224,28 +220,28 @@ impl Verifier {
                 && limits.max_artifacts > 0
                 && limits.max_total_artifact_bytes > 0
                 && limits.max_member_bytes > 0,
-            "runtime byte and count limits must be positive"
+            Error::configuration("runtime byte and count limits must be positive")
         );
         ensure!(
             policy.revocation != PortableRevocationPolicy::Online || limits.max_online_seconds > 0,
-            "online policy requires a positive deadline"
+            Error::configuration("online policy requires a positive deadline")
         );
         ensure!(
             policy.revocation == PortableRevocationPolicy::Disabled
                 || policy.revocation_max_age_seconds > 0,
-            "revocation freshness age must be positive"
+            Error::configuration("revocation freshness age must be positive")
         );
         ensure!(
             policy.revocation != PortableRevocationPolicy::Online || cfg!(feature = "online"),
-            "online policy requires the wintrust online feature"
+            Error::configuration("online policy requires the wintrust online feature")
         );
         ensure!(
             policy.schema_version == 1,
-            "unsupported portable trust policy version"
+            Error::configuration("unsupported portable trust policy version")
         );
         ensure!(
             !policy.roots.is_empty(),
-            "portable verification requires explicit trust anchors"
+            Error::configuration("portable verification requires explicit trust anchors")
         );
         validate_tsa_compatibility_policy(&policy)?;
         let count = [
@@ -257,11 +253,11 @@ impl Verifier {
         .iter()
         .try_fold(0usize, |sum, files| {
             sum.checked_add(files.len())
-                .context("artifact count overflow")
+                .ok_or_else(|| Error::resource_limit("artifact count overflow"))
         })?;
         ensure!(
             count <= limits.max_artifacts,
-            "portable trust artifact count exceeds limit"
+            Error::resource_limit("portable trust artifact count exceeds limit")
         );
         let mut total = 0usize;
         let mut load = |files: &[ArtifactRef]| -> Result<Vec<Vec<u8>>> {
@@ -271,24 +267,26 @@ impl Verifier {
                     ensure!(
                         artifact.sha256.len() == 64
                             && artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
-                        "invalid artifact SHA-256"
+                        Error::configuration("invalid artifact SHA-256")
                     );
                     let bytes = reader(artifact, limits.max_artifact_bytes)?;
                     ensure!(
                         bytes.len() <= limits.max_artifact_bytes,
-                        "trust artifact exceeds individual byte limit"
+                        Error::resource_limit("trust artifact exceeds individual byte limit")
                     );
                     total = total
                         .checked_add(bytes.len())
-                        .context("artifact size overflow")?;
+                        .ok_or_else(|| Error::resource_limit("artifact size overflow"))?;
                     ensure!(
                         total <= limits.max_total_artifact_bytes,
-                        "portable trust artifacts exceed total byte limit"
+                        Error::resource_limit("portable trust artifacts exceed total byte limit")
                     );
                     ensure!(
                         hex::encode(Sha256::digest(&bytes)) == artifact.sha256.to_ascii_lowercase(),
-                        "trust artifact SHA-256 mismatch: {}",
-                        artifact.sha256
+                        Error::policy(alloc::format!(
+                            "trust artifact SHA-256 mismatch: {}",
+                            artifact.path
+                        ))
                     );
                     Ok(bytes)
                 })
@@ -301,7 +299,7 @@ impl Verifier {
         for certificate in roots.iter().chain(&intermediates) {
             use der::Decode;
             x509_cert::Certificate::from_der(certificate)
-                .map_err(anyhow::Error::msg)
+                .map_err(Error::malformed)
                 .context("invalid runtime certificate DER")?;
         }
         let evaluation_time = match policy.verification_time {
@@ -309,7 +307,11 @@ impl Verifier {
             #[cfg(feature = "std")]
             None => SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
             #[cfg(not(feature = "std"))]
-            None => anyhow::bail!("no_std verification requires an explicit verification_time"),
+            None => {
+                return Err(Error::configuration(
+                    "no_std verification requires an explicit verification_time",
+                ));
+            }
         };
         policy.verification_time = Some(evaluation_time);
         let crl_labels = artifact_labels(&policy.crls);
@@ -347,11 +349,13 @@ fn validate_tsa_compatibility_policy(policy: &PortablePolicy) -> Result<()> {
     let pins = &policy.noncritical_tsa_certificate_sha256;
     ensure!(
         pins.len() <= 8,
-        "Microsoft TSA compatibility pin limit exceeded"
+        Error::configuration("Microsoft TSA compatibility pin limit exceeded")
     );
     ensure!(
         pins.is_empty() || policy.publisher == PublisherPolicy::MicrosoftWindows,
-        "noncritical TSA compatibility requires MicrosoftWindows publisher policy"
+        Error::configuration(
+            "noncritical TSA compatibility requires MicrosoftWindows publisher policy"
+        )
     );
     let mut unique = alloc::collections::BTreeSet::new();
     for pin in pins {
@@ -360,18 +364,19 @@ fn validate_tsa_compatibility_policy(policy: &PortablePolicy) -> Result<()> {
                 && pin
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "invalid lowercase Microsoft TSA certificate SHA-256"
+            Error::configuration("invalid lowercase Microsoft TSA certificate SHA-256")
         );
         ensure!(
             unique.insert(pin),
-            "duplicate Microsoft TSA certificate SHA-256"
+            Error::configuration("duplicate Microsoft TSA certificate SHA-256")
         );
     }
     Ok(())
 }
 
-const CODE_SIGNING_EKU: &str = "1.3.6.1.5.5.7.3.3";
-const WINDOWS_COMPONENT_EKU: &str = "1.3.6.1.4.1.311.10.3.6";
+const CODE_SIGNING_EKU: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
+const WINDOWS_COMPONENT_EKU: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.10.3.6");
 /// Full DER fingerprints of public roots acquired from Microsoft's PKI repository.
 /// Matching a display name never authorizes the Microsoft publisher policy.
 const MICROSOFT_ROOTS: &[&str] = &[
@@ -412,18 +417,7 @@ pub struct PortableTrustReport {
 }
 
 fn artifact_labels(refs: &[ArtifactRef]) -> Vec<String> {
-    refs.iter()
-        .map(|artifact| {
-            #[cfg(feature = "std")]
-            {
-                artifact.path.to_string_lossy().into_owned()
-            }
-            #[cfg(not(feature = "std"))]
-            {
-                artifact.path.clone()
-            }
-        })
-        .collect()
+    refs.iter().map(|artifact| artifact.path.clone()).collect()
 }
 
 #[cfg(feature = "online")]
@@ -470,10 +464,16 @@ impl Verifier {
         #[cfg(not(feature = "online"))]
         let started = ();
         let catalog = crate::catalog::parse(catalog_bytes, Default::default())?;
-        let signed = signed::verify_signed_data_with_policy(
+        let signed = signed::verify_signed_data(
             catalog_bytes,
-            "1.3.6.1.4.1.311.10.1",
-            self.policy.allow_sha1,
+            &signed::SignedDataOptions {
+                crypto: crypto::CryptoOptions {
+                    allow_sha1: self.policy.allow_sha1,
+                },
+                ..signed::SignedDataOptions::new(ObjectIdentifier::new_unwrap(
+                    "1.3.6.1.4.1.311.10.1",
+                ))
+            },
         )
         .context("catalog signature verification")?;
         ensure!(
@@ -494,8 +494,12 @@ impl Verifier {
             "member digest is not bound to the signed catalog"
         );
         let now = self.evaluation_time();
-        let mut certificates = signed.certificates;
-        certificates.extend(self.intermediates.iter().cloned());
+        let certificates = signed
+            .certificates
+            .iter()
+            .chain(&self.intermediates)
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
         let mut reports = Vec::new();
         for signer in signed.signers {
             let mut timestamp_revocation = None;
@@ -503,12 +507,14 @@ impl Verifier {
                 None
             } else {
                 let options = timestamp::TimestampOptions {
-                    issuer_candidates: &certificates,
-                    allow_sha1: self.policy.allow_sha1,
+                    issuer_candidates: (&certificates).into(),
+                    crypto: crypto::CryptoOptions {
+                        allow_sha1: self.policy.allow_sha1,
+                    },
                     noncritical_tsa_certificate_sha256: &self
                         .policy
                         .noncritical_tsa_certificate_sha256,
-                    ..timestamp::TimestampOptions::new(&self.roots, now)
+                    ..timestamp::TimestampOptions::new((&self.roots).into(), now)
                 };
                 timestamp::verify_timestamps_with_path_policy(
                     &signer,
@@ -534,14 +540,14 @@ impl Verifier {
             );
             let signature_time = timestamp.as_ref().map_or(now, |stamp| stamp.unix_time);
             let mut revocation = None;
+            let chain_options = chain::ChainOptions {
+                candidates: (&certificates).into(),
+                allow_sha1: self.policy.allow_sha1,
+                ..chain::ChainOptions::new(&self.roots, signature_time, CODE_SIGNING_EKU)
+            };
             let path = chain::validate_with_path_policy(
                 &signer.certificate_der,
-                &certificates,
-                &self.roots,
-                signature_time,
-                CODE_SIGNING_EKU,
-                self.policy.allow_sha1,
-                chain::PathLimits::default(),
+                &chain_options,
                 |candidate| {
                     if self.policy.publisher == PublisherPolicy::MicrosoftWindows {
                         ensure!(
@@ -637,15 +643,19 @@ impl Verifier {
                 .max_online_seconds
                 .checked_sub(_started.elapsed().as_secs())
                 .filter(|seconds| *seconds > 0)
-                .context("portable online verification deadline exceeded")?;
-            acquired = revocation::acquire_chain_revocation_with_signers(
-                path,
-                &self.intermediates,
-                now,
-                limits,
-                revocation::OnlineLimits {
-                    timeout_seconds: remaining.min(30),
-                    ..Default::default()
+                .ok_or_else(|| {
+                    Error::resource_limit("portable online verification deadline exceeded")
+                })?;
+            acquired = revocation::acquire_chain_revocation(
+                path.into(),
+                &revocation::AcquisitionOptions {
+                    crl_signers: (&self.intermediates).into(),
+                    limits,
+                    online_limits: revocation::OnlineLimits {
+                        timeout_seconds: remaining.min(30),
+                        ..Default::default()
+                    },
+                    ..revocation::AcquisitionOptions::new(now)
                 },
             )?;
             provenance.append(&mut acquired.provenance);
@@ -662,14 +672,15 @@ impl Verifier {
             .chain(&acquired.ocsp_responses)
             .map(Vec::as_slice)
             .collect::<Vec<_>>();
-        let mut report = revocation::verify_chain_revocation_with_borrowed_artifacts(
-            path,
-            &crls,
-            &ocsp,
-            &self.intermediates,
-            signature_time,
-            now,
-            limits,
+        let mut report = revocation::verify_chain_revocation(
+            path.into(),
+            &revocation::RevocationOptions {
+                crls: (&crls).into(),
+                ocsp: (&ocsp).into(),
+                crl_signers: (&self.intermediates).into(),
+                limits,
+                ..revocation::RevocationOptions::new(signature_time, now)
+            },
         )?;
         report.provenance = provenance;
         if let Some(certificate) = report.certificates.first_mut() {

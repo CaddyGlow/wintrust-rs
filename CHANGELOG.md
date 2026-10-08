@@ -1,24 +1,34 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-10-08
+
+### Added
+
+- `Verifier::from_artifact_reader` for hash-pinned in-memory artifacts and explicit evaluation times, and `revocation::pinned_provenance_labels` for filesystem-free evidence provenance.
+- `sip::member_hash_bytes` for raw digest consumers.
+- Freestanding `x86_64-unknown-none` build checks and default `no_std` tests in CI, alongside packaged-source test compilation.
+- Regression coverage for timestamp accuracy intervals, configured path limits, and retries through an alternative TSA path when the first path is revoked.
 
 ### Changed
 
-- The default library build now uses `no_std` with `alloc`. Enable `std` for filesystem APIs and automatic clock capture; `online` and `native-reference` imply it. Added `Verifier::from_artifact_reader` for pinned in-memory inputs and explicit evaluation times.
-
-- **Breaking Rust API change:** replace `PortableVerifier` and `ValidatedVerifier` with one immutable `Verifier`; every constructor validates policy, limits, pins and certificate DER and captures an omitted evaluation clock once. Safe Windows-name aliases now take `&Verifier`.
+- **Breaking Rust API change:** verification returns `wintrust::Result<T>` with typed errors for malformed inputs, unsupported algorithms, policy rejection, resource limits, invalid configuration, invalid signatures and I/O. Diagnostic context preserves the category; inspection retains `CatalogError`.
+- **Breaking Rust API change:** `ArtifactRef::path` is an opaque `String` with every feature configuration; filesystem adapters convert it to a path.
+- **Breaking Rust API change:** borrowed `CertificateStore` inputs accept owned DER collections and borrowed slices without copying their bytes. Consolidate chain, cryptographic, CMS, revocation and acquisition variants around `ChainOptions`, `CryptoOptions`, `SignatureOptions`, `SignedDataOptions`, `RevocationOptions` and `AcquisitionOptions`.
+- **Breaking Rust API change:** use typed OIDs, timestamp formats, certificate roles and artifact provenance categories. Serialized policy and report field values retain their existing formats.
+- **Breaking feature/API change:** the default library build uses `no_std` with `alloc` and requires an allocator. Enable `std` for filesystem APIs, `VerifierBuilder`, automatic clock capture and safe Windows-name aliases; `online` and `native-reference` enable it automatically. Verification without `std` requires an explicit evaluation time. Policy JSON field names and schema remain unchanged.
+- **Breaking Rust API change:** replace `PortableVerifier` and `ValidatedVerifier` with one immutable `Verifier`; every constructor validates policy, limits, pins and certificate DER. With `std`, an omitted evaluation clock is captured once during construction. Safe Windows-name aliases now take `&Verifier`.
 - **Breaking Rust API change:** timestamp functions take `TimestampOptions` with explicit roots, issuer candidates, evaluation time, SHA-1 policy, path limits and Microsoft TSA pins; remove redundant `_with_policy` overloads.
 - **Breaking Rust API change:** `VerifiedSignedData<'a>` borrows CMS/detached content instead of copying payload buffers; signer and certificate reports remain owned.
 - Share bounded DER traversal, CTL metadata decoding and certificate path constraints; retain parsed CMS certificates across signers and borrow pinned revocation evidence during verification.
 - Represent authenticated and freshness-checked CRLs with separate private types; releasing a certificate hold requires a lookup in the same checked fresh delta.
-- Add `sip::member_hash_bytes` for raw digest consumers and consolidate deterministic certificate test support.
-
+- Preserve Unicode name-constraint normalization through a private `alloc`-compatible copy of the upstream stringprep implementation, including its tables and licenses.
+- Consolidate deterministic certificate test support and use raw digest bytes internally instead of hexadecimal round trips.
 
 ### Fixed
 
 - Require one TSA path to cover the entire RFC3161 accuracy interval and apply configured search limits in every timestamp branch.
 - Evaluate TSA publisher authorization and revocation during alternative path selection, including pinned Microsoft compatibility.
-- Remove excluded Microsoft fixture dependencies from packaged library unit tests and compile packaged tests in CI.
+- Remove excluded Microsoft fixture dependencies from packaged library unit tests; retain Microsoft interoperability checks in repository-only integration tests.
 - Refresh the independent fuzz workspace lockfile for the current crate and dependencies.
 - Require fresh delta CRLs before releasing a certificate hold.
 - Use supplied intermediate certificates in normal RFC3161 timestamp verification.

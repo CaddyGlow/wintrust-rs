@@ -10,7 +10,7 @@
 //!
 //! ```
 //! # #[cfg(feature = "std")]
-//! # fn example() -> anyhow::Result<()> {
+//! # fn example() -> wintrust::error::Result<()> {
 //! use wintrust::{CryptCATAdminAcquireContext2, crypt_cat_admin_acquire_context2};
 //! use wintrust::portable::sip::{DigestAlgorithm, MemberHashPolicy, SipKind};
 //!
@@ -21,7 +21,7 @@
 //!     DigestAlgorithm::Sha256, SipKind::FlatXml, MemberHashPolicy::default(),
 //! )?;
 //! # let _ = (context, other);
-//! # Ok::<(), anyhow::Error>(())
+//! # Ok::<(), wintrust::error::Error>(())
 //! # }
 //! ```
 
@@ -37,6 +37,12 @@ pub mod catalog;
 pub mod catalog_trust;
 pub mod ctl;
 mod der;
+pub mod error;
+pub use error::{Error, Result};
+mod certificates;
+pub use ::der::asn1::ObjectIdentifier;
+pub use certificates::CertificateStore;
+mod oid_serde;
 mod stringprep;
 
 #[cfg(feature = "std")]

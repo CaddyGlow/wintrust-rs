@@ -4,7 +4,7 @@ Portable Rust catalog trust.
 
 ```toml
 [dependencies]
-wintrust = "0.1.2"
+wintrust = "0.2.0"
 ```
 
  The implementation includes CMS/CTL,
@@ -38,7 +38,7 @@ use wintrust::{WinVerifyTrust, portable::{PortableLimits, Verifier, sip::SipKind
 let verifier = Verifier::load(Path::new("trust.json"), PortableLimits::default())?;
 let report = WinVerifyTrust(&verifier, Path::new("update.cat"), Path::new("component.mum"), SipKind::FlatXml)?;
 assert!(report.trust_established);
-# Ok::<(), anyhow::Error>(())
+# Ok::<(), wintrust::Error>(())
 ```
 
 The default implementation is Rust on all platforms. Feature `native-reference`
@@ -70,7 +70,7 @@ and [file hashing](https://learn.microsoft.com/en-us/windows/win32/api/mscat/nf-
 ## Migration from 0.1
 
 CRL/OCSP acquisition is now optional. Applications using `PortableRevocationPolicy::Online`
-must enable `wintrust = { version = "0.1.2", features = ["online"] }`.
+must enable `wintrust = { version = "0.2.0", features = ["online"] }`.
 Offline parsing and verification require no HTTP client. Windows-name aliases remain available and accept the validated verifier.
 See the [Rust API migration](docs/portable-catalog-trust.md#rust-api-migration)
 for the unreleased verifier and timestamp changes.
@@ -105,8 +105,15 @@ Enable `std` for filesystem loading, automatic clock capture, `Verifier::builder
 and Windows-name API aliases:
 
 ```toml
-wintrust = { version = "0.1.2", features = ["std"] }
+wintrust = { version = "0.2.0", features = ["std"] }
 ```
 
 `online` and `native-reference` automatically enable `std`. A default build is
 checked against the freestanding `x86_64-unknown-none` target in CI.
+
+Verification APIs return typed `wintrust::Error` values. Low-level verification
+uses `ChainOptions`, `RevocationOptions`, `CryptoOptions`, `SignatureOptions`,
+and `SignedDataOptions`; DER collections accept borrowed buffers through
+`CertificateStore`. Artifact identifiers remain `String` with every feature set.
+OIDs and report categories use domain types while retaining their serialized
+string values. See the [API migration guide](docs/portable-catalog-trust.md#rust-api-migration).

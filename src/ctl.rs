@@ -31,7 +31,7 @@ fn parse_attributes(n: Node<'_>) -> Result<Vec<CtlAttribute<'_>>, CatalogError> 
                 return Err(bad("empty CTL attribute values"));
             }
             Ok(CtlAttribute {
-                oid: crate::der::typed_oid(fields[0])?,
+                oid: crate::der::oid(fields[0])?,
                 values: values.into_iter().map(|n| n.full).collect(),
             })
         })
@@ -56,9 +56,9 @@ pub struct ParsedCtl<'a> {
 /// Dedicated CTL bootstrap policy. Embedded signer certificates are only issuer
 /// candidates, and never implicitly become anchors.
 pub struct CtlAuthenticationPolicy<'a> {
-    pub bootstrap_anchors: &'a [Vec<u8>],
-    pub issuer_candidates: &'a [Vec<u8>],
-    pub required_signer_eku: &'a str,
+    pub bootstrap_anchors: crate::portable::CertificateStore<'a>,
+    pub issuer_candidates: crate::portable::CertificateStore<'a>,
+    pub required_signer_eku: ObjectIdentifier,
     pub required_list_usage: ObjectIdentifier,
     pub verification_time: u64,
     pub minimum_sequence: Option<&'a [u8]>,
@@ -87,23 +87,23 @@ impl AuthenticatedCtl {
     }
 }
 
-fn unix_time(value: &str) -> anyhow::Result<u64> {
+fn unix_time(value: &str) -> crate::error::Result<u64> {
     use der::Decode;
     let tag = match value.len() {
         13 => 0x17,
         15 => 0x18,
-        _ => anyhow::bail!("invalid CTL time length"),
+        _ => crate::error::bail!(crate::error::Error::malformed("invalid CTL time length")),
     };
     let mut encoded = vec![tag, value.len() as u8];
     encoded.extend_from_slice(value.as_bytes());
     Ok(if tag == 0x17 {
         der::asn1::UtcTime::from_der(&encoded)
-            .map_err(anyhow::Error::msg)?
+            .map_err(crate::error::Error::malformed)?
             .to_unix_duration()
             .as_secs()
     } else {
         der::asn1::GeneralizedTime::from_der(&encoded)
-            .map_err(anyhow::Error::msg)?
+            .map_err(crate::error::Error::malformed)?
             .to_unix_duration()
             .as_secs()
     })
@@ -121,27 +121,31 @@ pub fn authenticate(
     cms: &[u8],
     policy: &CtlAuthenticationPolicy<'_>,
     limits: CatalogLimits,
-) -> anyhow::Result<AuthenticatedCtl> {
+) -> crate::error::Result<AuthenticatedCtl> {
+    use crate::error::{Context, ensure};
     use crate::portable::{chain, signed};
-    use anyhow::{Context, ensure};
     ensure!(
         !policy.bootstrap_anchors.is_empty(),
-        "CTL authentication requires dedicated bootstrap anchors"
-    );
-    ensure!(
-        !policy.required_signer_eku.is_empty(),
-        "CTL authentication requires an explicit signer purpose"
+        crate::error::Error::configuration(
+            "CTL authentication requires dedicated bootstrap anchors"
+        )
     );
     ensure!(
         policy.max_age_seconds > 0,
-        "CTL freshness bound must be positive"
+        crate::error::Error::configuration("CTL freshness bound must be positive")
     );
-    ensure!(cms.len() <= limits.max_bytes, "CTL CMS byte limit");
-    let verified = signed::verify_cms_signed_data(
+    ensure!(
+        cms.len() <= limits.max_bytes,
+        crate::error::Error::resource_limit("CTL CMS byte limit")
+    );
+    let verified = signed::verify_signed_data(
         cms,
-        "1.3.6.1.4.1.311.10.1",
-        signed::SignedDataContent::Embedded,
-        policy.allow_sha1,
+        &signed::SignedDataOptions {
+            crypto: crate::portable::crypto::CryptoOptions {
+                allow_sha1: policy.allow_sha1,
+            },
+            ..signed::SignedDataOptions::new(ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.10.1"))
+        },
     )?;
     let encoded = if verified.content_der.first() == Some(&0x30) {
         verified.content_der
@@ -172,7 +176,7 @@ pub fn authenticate(
     if let Some(minimum) = policy.minimum_sequence {
         ensure!(
             !minimum.is_empty() && minimum[0] & 0x80 == 0,
-            "invalid CTL sequence floor"
+            crate::error::Error::configuration("invalid CTL sequence floor")
         );
         let sequence = unsigned_sequence(
             list.sequence_number
@@ -184,22 +188,40 @@ pub fn authenticate(
             "CTL sequence rollback"
         );
     }
-    let mut candidates = verified.certificates;
-    candidates.extend_from_slice(policy.issuer_candidates);
+    ensure!(
+        verified
+            .certificates
+            .len()
+            .checked_add(policy.issuer_candidates.len())
+            .and_then(|count| count.checked_add(policy.bootstrap_anchors.len()))
+            .is_some_and(|count| count <= chain::PathLimits::default().max_store_certificates),
+        crate::error::Error::resource_limit("CTL certificate store count limit")
+    );
+    let candidate_bytes = verified
+        .certificates
+        .iter()
+        .map(Vec::as_slice)
+        .chain(policy.issuer_candidates.iter())
+        .collect::<Vec<_>>();
+    let candidates = crate::portable::CertificateStore::from(candidate_bytes.as_slice());
     let signer_paths = verified
         .signers
         .iter()
         .map(|signer| {
-            chain::validate_with_policy(
+            chain::validate(
                 &signer.certificate_der,
-                &candidates,
-                policy.bootstrap_anchors,
-                policy.verification_time,
-                policy.required_signer_eku,
-                policy.allow_sha1,
+                &chain::ChainOptions {
+                    candidates,
+                    allow_sha1: policy.allow_sha1,
+                    ..chain::ChainOptions::new(
+                        policy.bootstrap_anchors,
+                        policy.verification_time,
+                        policy.required_signer_eku,
+                    )
+                },
             )
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect::<crate::error::Result<Vec<_>>>()?;
     ensure!(!signer_paths.is_empty(), "CTL has no authenticated signers");
     Ok(AuthenticatedCtl {
         encoded: encoded.to_vec(),
@@ -239,7 +261,7 @@ pub(crate) fn parse_node(
     }
     let subject_usage = children(field(&fields, pos, 0x30)?)?
         .into_iter()
-        .map(crate::der::typed_oid)
+        .map(crate::der::oid)
         .collect::<Result<Vec<_>, _>>()?;
     pos += 1;
     let list_identifier = if fields.get(pos).is_some_and(|n| n.tag == 4) {
@@ -274,7 +296,7 @@ pub(crate) fn parse_node(
         if !(1..=2).contains(&alg.len()) {
             return Err(bad("invalid AlgorithmIdentifier"));
         }
-        crate::der::typed_oid(alg[0])?
+        crate::der::oid(alg[0])?
     };
     pos += 1;
     let mut entries = Vec::new();

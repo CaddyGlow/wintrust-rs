@@ -183,7 +183,7 @@ fn supplied_intermediate_completes_tsa_path_and_rejected_root_tries_alternative(
         signature: signature.to_vec(),
         signed_attributes: vec![],
         unsigned_attributes: vec![(
-            timestamp::RFC3161_ATTRIBUTE.into(),
+            timestamp::RFC3161_ATTRIBUTE,
             vec![fs::read(dir.join("token.der")).unwrap()],
         )],
     };
@@ -191,9 +191,9 @@ fn supplied_intermediate_completes_tsa_path_and_rejected_root_tries_alternative(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let mut options = timestamp::TimestampOptions::new(&roots, now);
+    let mut options = timestamp::TimestampOptions::new((&roots).into(), now);
     assert!(timestamp::verify_timestamps(&signer, &options).is_err());
-    options.issuer_candidates = &issuers;
+    options.issuer_candidates = (&issuers).into();
     let supplied = timestamp::verify_timestamps(&signer, &options)
         .unwrap()
         .unwrap();
@@ -201,7 +201,9 @@ fn supplied_intermediate_completes_tsa_path_and_rejected_root_tries_alternative(
     let mut paths = 0;
     let verified = timestamp::verify_timestamps_with_path_policy(&signer, &options, |_, _| {
         paths += 1;
-        anyhow::ensure!(paths > 1, "first TSA root rejected by policy");
+        if paths <= 1 {
+            return Err(wintrust::Error::policy("first TSA root rejected by policy"));
+        }
         Ok(())
     })
     .unwrap()

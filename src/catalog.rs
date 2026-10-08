@@ -5,12 +5,15 @@ use alloc::{
     vec::Vec,
 };
 use core::fmt;
-use der::{Decode, asn1::AnyRef};
+use der::{
+    Decode,
+    asn1::{AnyRef, ObjectIdentifier},
+};
 use serde::Serialize;
 
-const SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
-const CTL: &str = "1.3.6.1.4.1.311.10.1";
-const INDIRECT: &str = "1.3.6.1.4.1.311.2.1.4";
+const SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+const CTL: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.10.1");
+const INDIRECT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.2.1.4");
 
 #[derive(Clone, Copy, Debug)]
 pub struct CatalogLimits {
@@ -52,8 +55,10 @@ impl From<der::Error> for CatalogError {
 }
 #[derive(Debug, Serialize)]
 pub struct Catalog {
-    pub content_type: String,
-    pub digest_algorithms: Vec<String>,
+    #[serde(with = "crate::oid_serde")]
+    pub content_type: ObjectIdentifier,
+    #[serde(with = "crate::oid_serde::vec")]
+    pub digest_algorithms: Vec<ObjectIdentifier>,
     pub certificate_count: usize,
     pub signers: Vec<Signer>,
     pub ctl: CertificateTrustList,
@@ -61,26 +66,31 @@ pub struct Catalog {
 }
 #[derive(Debug, Serialize)]
 pub struct Signer {
-    pub digest_algorithm: String,
-    pub signature_algorithm: String,
+    #[serde(with = "crate::oid_serde")]
+    pub digest_algorithm: ObjectIdentifier,
+    #[serde(with = "crate::oid_serde")]
+    pub signature_algorithm: ObjectIdentifier,
     pub signature_bytes: usize,
     pub signed_attributes: Vec<Attribute>,
     pub unsigned_attributes: Vec<Attribute>,
 }
 #[derive(Debug, Serialize)]
 pub struct Attribute {
-    pub oid: String,
+    #[serde(with = "crate::oid_serde")]
+    pub oid: ObjectIdentifier,
     pub values_der_hex: Vec<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct CertificateTrustList {
     pub version: u64,
-    pub subject_usage: Vec<String>,
+    #[serde(with = "crate::oid_serde::vec")]
+    pub subject_usage: Vec<ObjectIdentifier>,
     pub list_identifier_hex: Option<String>,
     pub sequence_number_hex: Option<String>,
     pub this_update: String,
     pub next_update: Option<String>,
-    pub subject_algorithm: String,
+    #[serde(with = "crate::oid_serde")]
+    pub subject_algorithm: ObjectIdentifier,
     pub members: Vec<CatalogMember>,
     pub extensions_der_hex: Option<String>,
     /// Exact CTL DER encoding; legacy PKCS#7 signs its value octets, not a CMS OCTET STRING.
@@ -94,8 +104,10 @@ pub struct CatalogMember {
 }
 #[derive(Debug, Serialize)]
 pub struct IndirectData {
-    pub data_type: String,
-    pub digest_algorithm: String,
+    #[serde(with = "crate::oid_serde")]
+    pub data_type: ObjectIdentifier,
+    #[serde(with = "crate::oid_serde")]
+    pub digest_algorithm: ObjectIdentifier,
     pub digest_hex: String,
 }
 
@@ -103,7 +115,7 @@ pub(crate) use crate::der::{Node, children, field, node, oid, preflight, tagged}
 pub(crate) fn bad(message: &str) -> CatalogError {
     CatalogError::Malformed(message.into())
 }
-pub(crate) fn algorithm(n: Node<'_>) -> Result<String, CatalogError> {
+pub(crate) fn algorithm(n: Node<'_>) -> Result<ObjectIdentifier, CatalogError> {
     let fields = children(tagged(n, 0x30)?)?;
     if fields.is_empty() || fields.len() > 2 {
         return Err(bad("invalid AlgorithmIdentifier"));
@@ -199,7 +211,7 @@ fn indirect(n: Node<'_>) -> Result<IndirectData, CatalogError> {
     }
     let digest_algorithm = algorithm(digest[0])?;
     let bytes = tagged(digest[1], 4)?.value;
-    let expected = match digest_algorithm.as_str() {
+    let expected = match digest_algorithm.to_string().as_str() {
         "1.3.14.3.2.26" => Some(20),
         "2.16.840.1.101.3.4.2.1" => Some(32),
         "2.16.840.1.101.3.4.2.2" => Some(48),
@@ -231,14 +243,14 @@ fn ctl(n: Node<'_>, limits: CatalogLimits) -> Result<CertificateTrustList, Catal
                 .attributes
                 .iter()
                 .map(|attr| Attribute {
-                    oid: attr.oid.to_string(),
+                    oid: attr.oid,
                     values_der_hex: attr.values.iter().map(hex::encode).collect(),
                 })
                 .collect();
             let mut indirect_data = None;
             let mut indirect_der = None;
             for attr in &entry.attributes {
-                if attr.oid.to_string() == INDIRECT {
+                if attr.oid == INDIRECT {
                     if indirect_data.is_some() {
                         return Err(bad("duplicate indirect data"));
                     }
@@ -260,12 +272,12 @@ fn ctl(n: Node<'_>, limits: CatalogLimits) -> Result<CertificateTrustList, Catal
             {
                 let supported = indirect_data.as_ref().is_some_and(|data| {
                     matches!(
-                        data.data_type.as_str(),
+                        data.data_type.to_string().as_str(),
                         "1.3.6.1.4.1.311.2.1.15"
                             | "1.3.6.1.4.1.311.2.1.18"
                             | "1.3.6.1.4.1.311.2.1.25"
                     ) && matches!(
-                        data.digest_algorithm.as_str(),
+                        data.digest_algorithm.to_string().as_str(),
                         "1.3.14.3.2.26"
                             | "2.16.840.1.101.3.4.2.1"
                             | "2.16.840.1.101.3.4.2.2"
@@ -287,16 +299,12 @@ fn ctl(n: Node<'_>, limits: CatalogLimits) -> Result<CertificateTrustList, Catal
     }
     Ok(CertificateTrustList {
         version: metadata.version,
-        subject_usage: metadata
-            .subject_usage
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
+        subject_usage: metadata.subject_usage,
         list_identifier_hex: metadata.list_identifier.map(hex::encode),
         sequence_number_hex: metadata.sequence_number.map(hex::encode),
         this_update: metadata.this_update,
         next_update: metadata.next_update,
-        subject_algorithm: metadata.subject_algorithm.to_string(),
+        subject_algorithm: metadata.subject_algorithm,
         members,
         extensions_der_hex: metadata.extensions.map(hex::encode),
         encoded_hex: hex::encode(n.full),
@@ -403,10 +411,10 @@ pub fn match_flat_xml_member(catalog: &Catalog, bytes: &[u8]) -> Result<Vec<usiz
     let mut matched = Vec::new();
     for (index, member) in catalog.ctl.members.iter().enumerate() {
         if let Some(indirect) = &member.indirect_data {
-            if indirect.data_type != "1.3.6.1.4.1.311.2.1.25" {
+            if indirect.data_type != ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.2.1.25") {
                 continue;
             }
-            let digest = match indirect.digest_algorithm.as_str() {
+            let digest = match indirect.digest_algorithm.to_string().as_str() {
                 "1.3.14.3.2.26" => &sha1,
                 "2.16.840.1.101.3.4.2.1" => &sha256,
                 _ => continue,

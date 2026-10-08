@@ -1,7 +1,8 @@
 //! Portable, explicit catalog member hashing. Unknown SIP formats fail closed.
 use crate::catalog::Catalog;
+use crate::error::{Context, Result, ensure};
 use alloc::{string::String, vec, vec::Vec};
-use anyhow::{Context, Result, ensure};
+use der::asn1::ObjectIdentifier;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
@@ -24,21 +25,20 @@ pub enum DigestAlgorithm {
     Sha512,
 }
 impl DigestAlgorithm {
-    pub fn from_oid(oid: &str) -> Result<Self> {
-        match oid {
-            "1.3.14.3.2.26" => Ok(Self::Sha1),
-            "2.16.840.1.101.3.4.2.1" => Ok(Self::Sha256),
-            "2.16.840.1.101.3.4.2.2" => Ok(Self::Sha384),
-            "2.16.840.1.101.3.4.2.3" => Ok(Self::Sha512),
-            _ => anyhow::bail!("unsupported member digest algorithm {oid}"),
-        }
+    pub fn from_oid(oid: ObjectIdentifier) -> Result<Self> {
+        [Self::Sha1, Self::Sha256, Self::Sha384, Self::Sha512]
+            .into_iter()
+            .find(|algorithm| algorithm.oid() == oid)
+            .ok_or_else(|| {
+                crate::error::Error::unsupported(alloc::format!("member digest algorithm {oid}"))
+            })
     }
-    pub fn oid(self) -> &'static str {
+    pub fn oid(self) -> ObjectIdentifier {
         match self {
-            Self::Sha1 => "1.3.14.3.2.26",
-            Self::Sha256 => "2.16.840.1.101.3.4.2.1",
-            Self::Sha384 => "2.16.840.1.101.3.4.2.2",
-            Self::Sha512 => "2.16.840.1.101.3.4.2.3",
+            Self::Sha1 => ObjectIdentifier::new_unwrap("1.3.14.3.2.26"),
+            Self::Sha256 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
+            Self::Sha384 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2"),
+            Self::Sha512 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3"),
         }
     }
 }
@@ -71,7 +71,10 @@ fn range(bytes: &[u8], start: usize, length: usize) -> Result<&[u8]> {
 fn pe_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     let parsed = hexspell::pe::view::PeHeaders::parse(bytes).context("invalid PE headers")?;
     let pe = parsed.nt;
-    ensure!(pe >= 0x40, "invalid PE signature");
+    ensure!(
+        pe >= 0x40,
+        crate::error::Error::malformed("invalid PE signature")
+    );
     let sections = usize::from(parsed.coff.number_of_sections.value);
     ensure!(sections <= 4096, "excessive PE section count");
     let optional_length = usize::from(parsed.coff.size_of_optional_header.value);
@@ -81,7 +84,10 @@ fn pe_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
         .directory_offset()
         .context("unsupported PE optional header")?;
     let count_offset = directory - 4;
-    ensure!(optional_length >= directory, "truncated PE optional header");
+    ensure!(
+        optional_length >= directory,
+        crate::error::Error::malformed("truncated PE optional header")
+    );
     let headers = u32_at(bytes, optional + 60)? as usize;
     let checksum = optional + 64;
     let count = u32_at(bytes, optional + count_offset)? as usize;
@@ -91,7 +97,9 @@ fn pe_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     );
     let security = optional + directory + 4 * 8;
     let (certificate, certificate_size) = if count > 4 {
-        let (offset, size) = parsed.directory_slot(4)?;
+        let (offset, size) = parsed
+            .directory_slot(4)
+            .map_err(crate::error::Error::malformed)?;
         (offset as usize, size as usize)
     } else {
         (0, 0)
@@ -106,7 +114,7 @@ fn pe_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
         .context("PE section table overflow")?;
     ensure!(
         headers >= section_table_end && headers <= bytes.len(),
-        "invalid PE header size"
+        crate::error::Error::malformed("invalid PE header size")
     );
     ensure!(checksum + 4 <= headers, "PE checksum lies outside headers");
     let mut chunks = vec![range(bytes, 0, checksum)?];
@@ -145,12 +153,17 @@ fn pe_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
             certificate % 8 == 0
                 && certificate >= last
                 && certificate.checked_add(certificate_size) == Some(bytes.len()),
-            "unsupported nonterminal or overlapping PE certificate table"
+            crate::error::Error::unsupported(
+                "unsupported nonterminal or overlapping PE certificate table"
+            )
         );
         let mut cursor = certificate;
         while cursor < bytes.len() {
             let length = u32_at(bytes, cursor)? as usize;
-            ensure!(length >= 8, "invalid WIN_CERTIFICATE length");
+            ensure!(
+                length >= 8,
+                crate::error::Error::malformed("invalid WIN_CERTIFICATE length")
+            );
             let rounded = length
                 .checked_add(7)
                 .context("certificate length overflow")?
@@ -158,7 +171,10 @@ fn pe_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
             cursor = cursor
                 .checked_add(rounded)
                 .context("certificate offset overflow")?;
-            ensure!(cursor <= bytes.len(), "truncated WIN_CERTIFICATE");
+            ensure!(
+                cursor <= bytes.len(),
+                crate::error::Error::malformed("truncated WIN_CERTIFICATE")
+            );
         }
         certificate
     } else {
@@ -176,7 +192,7 @@ fn pe_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
 fn flat_xml(bytes: &[u8]) -> Result<()> {
     let text = core::str::from_utf8(bytes).context("flat XML member is not UTF-8")?;
     let xml = roxmltree::Document::parse(text)
-        .map_err(anyhow::Error::msg)
+        .map_err(crate::error::Error::malformed)
         .context("invalid flat XML member")?;
     ensure!(
         xml.root_element().tag_name().name() == "assembly",
@@ -221,7 +237,7 @@ pub fn member_hash_bytes(
 ) -> Result<Vec<u8>> {
     ensure!(
         bytes.len() <= policy.max_member_bytes,
-        "catalog member exceeds byte limit"
+        crate::error::Error::resource_limit("catalog member exceeds byte limit")
     );
     ensure!(
         algorithm != DigestAlgorithm::Sha1 || policy.allow_sha1,
@@ -266,7 +282,7 @@ pub fn match_catalog_member(
 ) -> Result<Vec<usize>> {
     ensure!(
         bytes.len() <= policy.max_member_bytes,
-        "catalog member exceeds byte limit"
+        crate::error::Error::resource_limit("catalog member exceeds byte limit")
     );
     let mut matched = Vec::new();
     let mut hashes: [Option<String>; 4] = [None, None, None, None];
@@ -275,17 +291,22 @@ pub fn match_catalog_member(
             continue;
         };
         let compatible = match kind {
-            SipKind::Pe => indirect.data_type == "1.3.6.1.4.1.311.2.1.15",
-            SipKind::FlatXml | SipKind::FlatRaw => matches!(
-                indirect.data_type.as_str(),
-                "1.3.6.1.4.1.311.2.1.18" | "1.3.6.1.4.1.311.2.1.25"
-            ),
-            SipKind::Cab => indirect.data_type == "1.3.6.1.4.1.311.2.1.25",
+            SipKind::Pe => {
+                indirect.data_type == ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.2.1.15")
+            }
+            SipKind::FlatXml | SipKind::FlatRaw => [
+                ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.2.1.18"),
+                ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.2.1.25"),
+            ]
+            .contains(&indirect.data_type),
+            SipKind::Cab => {
+                indirect.data_type == ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.2.1.25")
+            }
         };
         if !compatible {
             continue;
         }
-        let Ok(algorithm) = DigestAlgorithm::from_oid(&indirect.digest_algorithm) else {
+        let Ok(algorithm) = DigestAlgorithm::from_oid(indirect.digest_algorithm) else {
             continue;
         };
         if algorithm == DigestAlgorithm::Sha1 && !policy.allow_sha1 {
@@ -313,13 +334,16 @@ pub fn match_catalog_member(
 fn cab_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     ensure!(
         bytes.starts_with(b"MSCF") && bytes.len() >= 36,
-        "invalid CAB signature/header"
+        crate::error::Error::malformed("invalid CAB signature/header")
     );
     ensure!(
         u32_at(bytes, 4)? == 0 && u32_at(bytes, 12)? == 0 && u32_at(bytes, 20)? == 0,
-        "invalid CAB reserved fields"
+        crate::error::Error::malformed("invalid CAB reserved fields")
     );
-    ensure!(bytes[24] == 3 && bytes[25] == 1, "unsupported CAB version");
+    ensure!(
+        bytes[24] == 3 && bytes[25] == 1,
+        crate::error::Error::unsupported("unsupported CAB version")
+    );
     let flags = u16_at(bytes, 30)?;
     ensure!(flags & !7 == 0, "unknown CAB flags");
     let cabinet_size = u32_at(bytes, 8)? as usize;
@@ -328,7 +352,7 @@ fn cab_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     let (header_end, payload_end, signed) = if flags & 4 != 0 {
         ensure!(
             u32_at(bytes, 36)? == 20 && u32_at(bytes, 40)? == 0x0010_0000,
-            "unsupported CAB reserve/SIP layout"
+            crate::error::Error::unsupported("unsupported CAB reserve/SIP layout")
         );
         let signature = u32_at(bytes, 44)? as usize;
         let signature_size = u32_at(bytes, 48)? as usize;
@@ -337,7 +361,7 @@ fn cab_chunks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
                 && signature == cabinet_size
                 && signature_size > 0
                 && signature.checked_add(signature_size) == Some(bytes.len()),
-            "invalid signed CAB signature range"
+            crate::error::Error::malformed("invalid signed CAB signature range")
         );
         (60, signature, true)
     } else {

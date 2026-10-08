@@ -1,8 +1,8 @@
+use crate::error::{Context, Error, Result, ensure};
 use crate::portable::{
     PortableTrustReport, Verifier,
     sip::{self, DigestAlgorithm, MemberHashPolicy, SipKind},
 };
-use anyhow::{Context, Result, ensure};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -27,11 +27,11 @@ pub fn crypt_cat_admin_acquire_context2(
 ) -> Result<CatalogAdminContext> {
     ensure!(
         policy.max_member_bytes > 0,
-        "member byte limit must be positive"
+        Error::configuration("member byte limit must be positive")
     );
     ensure!(
         algorithm != DigestAlgorithm::Sha1 || policy.allow_sha1,
-        "SHA-1 requires explicit compatibility policy"
+        Error::configuration("SHA-1 requires explicit compatibility policy")
     );
     Ok(CatalogAdminContext {
         algorithm,
@@ -54,7 +54,7 @@ pub fn crypt_cat_admin_calc_hash_from_file_handle2(
     );
     ensure!(
         metadata.len() <= context.policy.max_member_bytes as u64,
-        "member byte limit exceeded"
+        Error::resource_limit("member byte limit exceeded")
     );
     let position = file.stream_position()?;
     let result = (|| {
@@ -65,7 +65,7 @@ pub fn crypt_cat_admin_calc_hash_from_file_handle2(
             .read_to_end(&mut bytes)?;
         ensure!(
             bytes.len() <= context.policy.max_member_bytes,
-            "member byte limit exceeded"
+            Error::resource_limit("member byte limit exceeded")
         );
         sip::member_hash_bytes(&bytes, context.kind, context.algorithm, &context.policy)
     })();

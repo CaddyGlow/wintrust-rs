@@ -4,8 +4,8 @@
 //!
 //! Qualifiers are parsed for syntax by the certificate decoder but never
 //! influence a decision, and no qualifier set is retained or reported.
-use alloc::{vec, vec::Vec};
-use anyhow::{Context, Result, bail, ensure};
+use crate::error::{Context, Error, Result, bail, ensure};
+use alloc::{format, vec, vec::Vec};
 use der::asn1::ObjectIdentifier;
 use x509_cert::{
     Certificate,
@@ -89,7 +89,10 @@ impl Tree {
         policy: ObjectIdentifier,
         expected: Vec<ObjectIdentifier>,
     ) -> Result<()> {
-        ensure!(self.nodes.len() < MAX_NODES, "policy tree node limit");
+        ensure!(
+            self.nodes.len() < MAX_NODES,
+            Error::resource_limit("policy tree node limit")
+        );
         let depth = self.nodes[parent].depth + 1;
         self.nodes.push(Node {
             policy,
@@ -268,19 +271,19 @@ fn certificate_policies(cert: &Certificate) -> Result<Option<Vec<ObjectIdentifie
     let Some((_, policies)) = cert
         .tbs_certificate
         .get::<CertificatePolicies>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
     else {
         return Ok(None);
     };
     ensure!(
         !policies.0.is_empty() && policies.0.len() <= 256,
-        "certificate policies count"
+        Error::resource_limit("certificate policies count")
     );
     let mut seen = alloc::collections::BTreeSet::new();
     for information in &policies.0 {
         ensure!(
             seen.insert(information.policy_identifier),
-            "duplicate certificate policy identifier"
+            Error::malformed("duplicate certificate policy identifier")
         );
     }
     Ok(Some(
@@ -292,14 +295,14 @@ fn policy_constraints(cert: &Certificate) -> Result<Option<PolicyConstraints>> {
     let Some((_, constraints)) = cert
         .tbs_certificate
         .get::<PolicyConstraints>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
     else {
         return Ok(None);
     };
     ensure!(
         constraints.require_explicit_policy.is_some()
             || constraints.inhibit_policy_mapping.is_some(),
-        "empty policy constraints"
+        Error::malformed("empty policy constraints")
     );
     Ok(Some(constraints))
 }
@@ -308,13 +311,13 @@ fn policy_mappings(cert: &Certificate) -> Result<Vec<(ObjectIdentifier, Vec<Obje
     let Some((_, mappings)) = cert
         .tbs_certificate
         .get::<PolicyMappings>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
     else {
         return Ok(Vec::new());
     };
     ensure!(
         !mappings.0.is_empty() && mappings.0.len() <= 256,
-        "policy mappings count"
+        Error::resource_limit("policy mappings count")
     );
     let mut grouped: Vec<(ObjectIdentifier, Vec<ObjectIdentifier>)> = Vec::new();
     for mapping in &mappings.0 {
@@ -344,7 +347,7 @@ fn inhibit_any_policy(cert: &Certificate) -> Result<Option<u64>> {
     Ok(cert
         .tbs_certificate
         .get::<InhibitAnyPolicy>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
         .map(|(_, value)| u64::from(value.0)))
 }
 
@@ -362,8 +365,11 @@ pub fn process(
     options: &PolicyOptions,
 ) -> Result<PolicyOutcome> {
     let n = path.len();
-    ensure!(n > 0, "policy processing requires at least one certificate");
-    ensure!(n < 1024, "policy path length");
+    ensure!(
+        n > 0,
+        Error::configuration("policy processing requires at least one certificate")
+    );
+    ensure!(n < 1024, Error::resource_limit("policy path length"));
     let n64 = n as u64;
     let mut tree = Tree::new();
     let mut explicit = if options.initial_explicit_policy {
@@ -409,7 +415,9 @@ pub fn process(
         }
         ensure!(
             explicit > 0 || !tree.is_null(),
-            "certificate policy requirements are not satisfied at depth {i}"
+            Error::policy(format!(
+                "certificate policy requirements are not satisfied at depth {i}"
+            ))
         );
         let constraints = policy_constraints(cert)?;
         if leaf {

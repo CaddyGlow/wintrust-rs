@@ -58,10 +58,10 @@ fn authenticated_ctl_requires_dedicated_anchor_purpose_freshness_and_sequence() 
     let catalog = catalog::parse(bytes, Default::default()).unwrap();
     let roots = vec![include_bytes!("fixtures/root.der").to_vec()];
     let policy = CtlAuthenticationPolicy {
-        bootstrap_anchors: &roots,
-        issuer_candidates: &[],
-        required_signer_eku: "1.3.6.1.5.5.7.3.3",
-        required_list_usage: catalog.ctl.subject_usage[0].parse().unwrap(),
+        bootstrap_anchors: (&roots).into(),
+        issuer_candidates: Default::default(),
+        required_signer_eku: "1.3.6.1.5.5.7.3.3".parse().unwrap(),
+        required_list_usage: catalog.ctl.subject_usage[0],
         verification_time: 1791117219,
         minimum_sequence: None,
         max_age_seconds: 365 * 86400,
@@ -93,12 +93,12 @@ fn authenticated_ctl_requires_dedicated_anchor_purpose_freshness_and_sequence() 
     };
     assert!(authenticate(bytes, &stale, Default::default()).is_err());
     let missing_bootstrap = CtlAuthenticationPolicy {
-        bootstrap_anchors: &[],
+        bootstrap_anchors: Default::default(),
         ..policy
     };
     assert!(authenticate(bytes, &missing_bootstrap, Default::default()).is_err());
     let wrong_purpose = CtlAuthenticationPolicy {
-        required_signer_eku: "1.2.3.4",
+        required_signer_eku: "1.2.3.4".parse().unwrap(),
         ..policy
     };
     assert!(authenticate(bytes, &wrong_purpose, Default::default()).is_err());

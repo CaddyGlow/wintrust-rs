@@ -150,20 +150,19 @@ fn build(specs: Vec<Spec>) -> Built {
         root: sign(root),
     }
 }
-fn run(specs: Vec<Spec>, policy: PolicyOptions) -> anyhow::Result<chain::ChainReport> {
+fn run(specs: Vec<Spec>, policy: PolicyOptions) -> wintrust::error::Result<chain::ChainReport> {
     let built = build(specs);
-    chain::validate_with_options(
+    chain::validate_with_path_policy(
         &built.leaf,
-        &built.intermediates,
-        &[built.root],
-        TIME,
-        EKU,
-        false,
-        PathLimits::default(),
-        &PathOptions {
-            policy,
-            partial_chain: false,
-            crl_signer: false,
+        &chain::ChainOptions {
+            allow_sha1: false,
+            limits: PathLimits::default(),
+            path: PathOptions {
+                policy,
+                partial_chain: false,
+                crl_signer: false,
+            },
+            ..support::chain_options(&built.intermediates, &[built.root], TIME, EKU)
         },
         |_| Ok(()),
     )
@@ -202,7 +201,7 @@ fn common_policy_is_valid_and_initial_set_intersects() {
         ]
     };
     let report = run(path(), explicit()).unwrap();
-    assert_eq!(report.valid_policies, [A]);
+    assert_eq!(report.valid_policies, [oid(A)]);
     let report = run(
         path(),
         PolicyOptions {
@@ -211,7 +210,7 @@ fn common_policy_is_valid_and_initial_set_intersects() {
         },
     )
     .unwrap();
-    assert_eq!(report.valid_policies, [A]);
+    assert_eq!(report.valid_policies, [oid(A)]);
     // B is asserted by the CA only and C by the end entity only.
     for rejected in [B, C] {
         assert!(
@@ -260,7 +259,7 @@ fn ca_require_explicit_policy_counts_skipped_certificates() {
         run(satisfied, PolicyOptions::default())
             .unwrap()
             .valid_policies,
-        [A]
+        [oid(A)]
     );
 }
 
@@ -284,7 +283,7 @@ fn mappings_rewrite_expected_policies_and_honor_inhibition() {
             spec(vec![policies(&[B])]),
         ]
     };
-    assert_eq!(run(path(), explicit()).unwrap().valid_policies, [B]);
+    assert_eq!(run(path(), explicit()).unwrap().valid_policies, [oid(B)]);
     // The user asks for the CA-side policy; the mapped end-entity policy follows it.
     let report = run(
         path(),
@@ -294,7 +293,7 @@ fn mappings_rewrite_expected_policies_and_honor_inhibition() {
         },
     )
     .unwrap();
-    assert_eq!(report.valid_policies, [B]);
+    assert_eq!(report.valid_policies, [oid(B)]);
     assert!(
         run(
             path(),
@@ -345,19 +344,22 @@ fn any_policy_expands_and_can_be_inhibited() {
         spec(vec![policies(&[ANY])]),
         spec(vec![policies(&[A])]),
     ];
-    assert_eq!(run(ca_any, explicit()).unwrap().valid_policies, [A]);
+    assert_eq!(run(ca_any, explicit()).unwrap().valid_policies, [oid(A)]);
     let leaf_any = vec![
         root(),
         spec(vec![policies(&[A])]),
         spec(vec![policies(&[ANY])]),
     ];
-    assert_eq!(run(leaf_any, explicit()).unwrap().valid_policies, [A]);
+    assert_eq!(run(leaf_any, explicit()).unwrap().valid_policies, [oid(A)]);
     let both_any = vec![
         root(),
         spec(vec![policies(&[ANY])]),
         spec(vec![policies(&[ANY])]),
     ];
-    assert_eq!(run(both_any, explicit()).unwrap().valid_policies, [ANY]);
+    assert_eq!(
+        run(both_any, explicit()).unwrap().valid_policies,
+        [oid(ANY)]
+    );
 
     let inhibited = PolicyOptions {
         initial_any_policy_inhibit: true,
@@ -401,7 +403,10 @@ fn self_issued_intermediate_still_expands_any_policy_under_inhibition() {
     };
     // RFC 5280 6.1.3 (d)(2)(ii): a self-issued non-final certificate expands
     // anyPolicy even when inhibitAnyPolicy is exhausted.
-    assert_eq!(run(path(true), explicit()).unwrap().valid_policies, [A]);
+    assert_eq!(
+        run(path(true), explicit()).unwrap().valid_policies,
+        [oid(A)]
+    );
     assert!(run(path(false), explicit()).is_err());
 }
 
@@ -456,7 +461,14 @@ fn report_retains_diagnostics_for_each_certificate() {
         .iter()
         .map(|c| c.role)
         .collect::<Vec<_>>();
-    assert_eq!(roles, ["end-entity", "intermediate", "anchor"]);
+    assert_eq!(
+        roles,
+        [
+            chain::CertificateRole::EndEntity,
+            chain::CertificateRole::Intermediate,
+            chain::CertificateRole::Anchor
+        ]
+    );
     assert!(
         report.certificates[1]
             .enforced_extensions
@@ -469,18 +481,17 @@ fn partial_chain_requires_explicit_selection_and_never_accepts_the_leaf() {
     let built = build(vec![root(), spec(vec![]), spec(vec![])]);
     let intermediate = built.intermediates[0].clone();
     let run = |partial_chain, anchors: &[Vec<u8>], leaf: &[u8]| {
-        chain::validate_with_options(
+        chain::validate_with_path_policy(
             leaf,
-            &built.intermediates,
-            anchors,
-            TIME,
-            EKU,
-            false,
-            PathLimits::default(),
-            &PathOptions {
-                policy: PolicyOptions::default(),
-                partial_chain,
-                crl_signer: false,
+            &chain::ChainOptions {
+                allow_sha1: false,
+                limits: PathLimits::default(),
+                path: PathOptions {
+                    policy: PolicyOptions::default(),
+                    partial_chain,
+                    crl_signer: false,
+                },
+                ..support::chain_options(&built.intermediates, anchors, TIME, EKU)
             },
             |_| Ok(()),
         )
@@ -520,18 +531,17 @@ fn rejected_alternative_paths_are_retained_in_the_selected_report() {
         // so make it fail through a name-independent check instead: expired trust is
         // modelled by an unsatisfiable initial policy set below.
         let (leaf, bad, good) = (sign(leaf), sign(bad), sign(good));
-        let report = chain::validate_with_options(
+        let report = chain::validate_with_path_policy(
             &leaf,
-            &[],
-            &[bad.clone(), good.clone()],
-            TIME,
-            EKU,
-            false,
-            PathLimits::default(),
-            &PathOptions::default(),
+            &chain::ChainOptions {
+                allow_sha1: false,
+                limits: PathLimits::default(),
+                path: PathOptions::default(),
+                ..support::chain_options(&[], &[bad.clone(), good.clone()], TIME, EKU)
+            },
             |report| {
                 // Reject paths ending at the bad anchor, as a caller policy would.
-                anyhow::ensure!(report.chain_der.last() != Some(&bad), "bad anchor");
+                support::require_policy(report.chain_der.last() != Some(&bad), "bad anchor")?;
                 Ok(())
             },
         )
@@ -740,18 +750,17 @@ fn openssl_agrees_on_policy_outcomes() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let ours = chain::validate_with_options(
+        let ours = chain::validate_with_path_policy(
             &built.leaf,
-            &built.intermediates,
-            &[built.root],
-            TIME,
-            EKU,
-            false,
-            PathLimits::default(),
-            &PathOptions {
-                policy: case.policy,
-                partial_chain: false,
-                crl_signer: false,
+            &chain::ChainOptions {
+                allow_sha1: false,
+                limits: PathLimits::default(),
+                path: PathOptions {
+                    policy: case.policy,
+                    partial_chain: false,
+                    crl_signer: false,
+                },
+                ..support::chain_options(&built.intermediates, &[built.root], TIME, EKU)
             },
             |_| Ok(()),
         );

@@ -1,5 +1,7 @@
 //! Strict, bounded explicit-anchor certificate path validation.
 use super::crypto;
+use crate::CertificateStore;
+use crate::error::{Context, Error, Result, bail, ensure};
 use alloc::{
     borrow::ToOwned,
     format,
@@ -7,8 +9,10 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use anyhow::{Context, Result, ensure};
-use der::{Decode, Encode, Reader, SliceReader, Tag, Tagged, asn1::AnyRef};
+use der::{
+    Decode, Encode, Reader, SliceReader, Tag, Tagged,
+    asn1::{AnyRef, ObjectIdentifier},
+};
 use sha2::{Digest, Sha256};
 use x509_cert::{
     Certificate,
@@ -29,18 +33,28 @@ pub struct ChainReport {
     pub microsoft_timestamp_policy_certificate_sha256: Option<String>,
     /// RFC 5280 6.1 `valid_policy` values at the end-entity level after
     /// intersection with the initial policy set. Empty when the policy tree is NULL.
-    pub valid_policies: Vec<String>,
+    #[serde(with = "crate::oid_serde::vec")]
+    pub valid_policies: Vec<ObjectIdentifier>,
     /// Per-certificate diagnostics for the selected path, end entity first.
     pub certificates: Vec<CertificateDiagnostic>,
     /// Bounded record of candidate paths rejected before this one was selected.
     pub rejected_paths: Vec<RejectedPath>,
 }
 
+/// Position of a certificate in the selected trust path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertificateRole {
+    EndEntity,
+    Intermediate,
+    Anchor,
+}
+
 /// Role and enforced path-validation extensions of one certificate in a selected path.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CertificateDiagnostic {
     pub sha256: String,
-    pub role: &'static str,
+    pub role: CertificateRole,
     pub self_issued: bool,
     /// Names of the RFC 5280 path-validation extensions present and enforced.
     pub enforced_extensions: Vec<&'static str>,
@@ -70,7 +84,8 @@ pub struct PathOptions {
 }
 const MICROSOFT_TIMESTAMP_PCA_2010: &str =
     "86ec118d1ee69670a46e2be29c4b4208be043e36600d4e1dd3f3d515ca119020";
-const MICROSOFT_TIMESTAMP_POLICY: &str = "1.3.6.1.4.1.311.46.3";
+const MICROSOFT_TIMESTAMP_POLICY: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.46.3");
 const MICROSOFT_TIMESTAMP_CPS: &str = "http://www.microsoft.com/PKI/docs/CPS/default.htm";
 const MICROSOFT_TIMESTAMP_NOTICE: &str = "\u{201d}Legal_Policy_Statement.\u{201d}";
 
@@ -81,13 +96,12 @@ fn validate_microsoft_timestamp_policy(bytes: &[u8]) -> Result<()> {
     use x509_cert::ext::pkix::CertificatePolicies;
     ensure!(
         bytes.len() <= 4096,
-        "timestamp certificate policy byte limit"
+        Error::resource_limit("timestamp certificate policy byte limit")
     );
-    let policies = CertificatePolicies::from_der(bytes).map_err(anyhow::Error::msg)?;
+    let policies = CertificatePolicies::from_der(bytes).map_err(Error::malformed)?;
     ensure!(
-        policies.0.len() == 1
-            && policies.0[0].policy_identifier.to_string() == MICROSOFT_TIMESTAMP_POLICY,
-        "unsupported Microsoft timestamp certificate policy"
+        policies.0.len() == 1 && policies.0[0].policy_identifier == MICROSOFT_TIMESTAMP_POLICY,
+        Error::unsupported("unsupported Microsoft timestamp certificate policy")
     );
     let qualifiers = policies.0[0]
         .policy_qualifiers
@@ -95,14 +109,14 @@ fn validate_microsoft_timestamp_policy(bytes: &[u8]) -> Result<()> {
         .context("Microsoft timestamp policy requires its qualifiers")?;
     ensure!(
         qualifiers.len() == 2,
-        "unsupported timestamp policy qualifiers"
+        Error::unsupported("unsupported timestamp policy qualifiers")
     );
     let mut seen = alloc::collections::BTreeSet::new();
     for qualifier in qualifiers {
         let oid = qualifier.policy_qualifier_id.to_string();
         ensure!(
             seen.insert(oid.clone()),
-            "duplicate timestamp policy qualifier"
+            Error::malformed("duplicate timestamp policy qualifier")
         );
         let value = qualifier
             .qualifier
@@ -112,44 +126,49 @@ fn validate_microsoft_timestamp_policy(bytes: &[u8]) -> Result<()> {
             "1.3.6.1.5.5.7.2.1" => {
                 let uri = value
                     .decode_as::<der::asn1::Ia5StringRef<'_>>()
-                    .map_err(anyhow::Error::msg)?;
+                    .map_err(Error::malformed)?;
                 ensure!(
                     uri.as_str() == MICROSOFT_TIMESTAMP_CPS,
-                    "unsupported timestamp CPS URI"
+                    Error::unsupported("unsupported timestamp CPS URI")
                 );
             }
             "1.3.6.1.5.5.7.2.2" => {
-                ensure!(value.tag() == Tag::Sequence, "invalid timestamp UserNotice");
-                let mut reader = SliceReader::new(value.value()).map_err(anyhow::Error::msg)?;
-                let text = AnyRef::decode(&mut reader).map_err(anyhow::Error::msg)?;
+                ensure!(
+                    value.tag() == Tag::Sequence,
+                    Error::malformed("invalid timestamp UserNotice")
+                );
+                let mut reader = SliceReader::new(value.value()).map_err(Error::malformed)?;
+                let text = AnyRef::decode(&mut reader).map_err(Error::malformed)?;
                 ensure!(
                     reader.is_finished(),
-                    "unsupported UserNotice noticeReference or extra fields"
+                    Error::unsupported("unsupported UserNotice noticeReference or extra fields")
                 );
                 ensure!(
                     text.tag() == Tag::BmpString,
-                    "unsupported UserNotice DisplayText form"
+                    Error::unsupported("unsupported UserNotice DisplayText form")
                 );
                 let bytes = text.value();
                 ensure!(
                     !bytes.is_empty() && bytes.len() <= 400 && bytes.len() % 2 == 0,
-                    "UserNotice DisplayText length limit"
+                    Error::resource_limit("UserNotice DisplayText length limit")
                 );
                 let mut message = String::new();
                 for pair in bytes.as_chunks::<2>().0 {
                     let value = u16::from_be_bytes([pair[0], pair[1]]);
                     ensure!(
                         !(0xd800..=0xdfff).contains(&value),
-                        "invalid BMPString surrogate"
+                        Error::malformed("invalid BMPString surrogate")
                     );
                     message.push(char::from_u32(u32::from(value)).context("invalid BMPString")?);
                 }
                 ensure!(
                     message == MICROSOFT_TIMESTAMP_NOTICE,
-                    "unsupported timestamp UserNotice text"
+                    Error::unsupported("unsupported timestamp UserNotice text")
                 );
             }
-            _ => anyhow::bail!("unsupported critical timestamp policy qualifier {oid}"),
+            _ => bail!(Error::unsupported(format!(
+                "unsupported critical timestamp policy qualifier {oid}"
+            ))),
         }
     }
     Ok(())
@@ -162,7 +181,7 @@ use names::{check_certificate_names, validate_name_constraints};
 fn validate_extensions(
     c: &Certificate,
     unix_time: u64,
-    eku: &str,
+    eku: ObjectIdentifier,
     leaf: bool,
     ca_below: usize,
     certificate_der: &[u8],
@@ -178,11 +197,14 @@ fn validate_extensions(
     let mut seen = alloc::collections::BTreeSet::new();
     let mut interpreted_timestamp_policy = false;
     for e in t.extensions.iter().flatten() {
-        ensure!(seen.insert(e.extn_id), "duplicate certificate extension");
+        ensure!(
+            seen.insert(e.extn_id),
+            Error::malformed("duplicate certificate extension")
+        );
         if e.critical && e.extn_id.to_string() == "2.5.29.32" {
             if microsoft_timestamp_compatibility
                 && !leaf
-                && eku == "1.3.6.1.5.5.7.3.8"
+                && eku == ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8")
                 && hex::encode(Sha256::digest(certificate_der)) == MICROSOFT_TIMESTAMP_PCA_2010
             {
                 validate_microsoft_timestamp_policy(e.extn_value.as_bytes())?;
@@ -192,13 +214,13 @@ fn validate_extensions(
                 // interpreted, qualifiers included. No generic qualifier is.
                 let policies =
                     x509_cert::ext::pkix::CertificatePolicies::from_der(e.extn_value.as_bytes())
-                        .map_err(anyhow::Error::msg)?;
+                        .map_err(Error::malformed)?;
                 ensure!(
                     policies
                         .0
                         .iter()
                         .all(|p| p.policy_qualifiers.as_ref().is_none_or(Vec::is_empty)),
-                    "unsupported critical certificate policy qualifier"
+                    Error::unsupported("unsupported critical certificate policy qualifier")
                 );
             }
         } else if e.critical {
@@ -214,29 +236,33 @@ fn validate_extensions(
                         | "2.5.29.36"
                         | "2.5.29.54"
                 ),
-                "unsupported critical certificate extension {}",
-                e.extn_id
+                Error::unsupported(format!(
+                    "unsupported critical certificate extension {}",
+                    e.extn_id
+                ))
             );
         }
     }
     if let Some((critical, constraints)) = t
         .get::<x509_cert::ext::pkix::NameConstraints>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
     {
         ensure!(
             !leaf && critical,
-            "unsupported certificate constraint: name constraints require a critical CA extension"
+            Error::unsupported(
+                "unsupported certificate constraint: name constraints require a critical CA extension"
+            )
         );
         validate_name_constraints(&constraints)?;
     }
     if let Some((critical, names)) = t
         .get::<x509_cert::ext::pkix::SubjectAltName>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
     {
         use x509_cert::ext::pkix::name::GeneralName;
         ensure!(
             !names.0.is_empty() && names.0.len() <= 256,
-            "subject alternative name count limit"
+            Error::resource_limit("subject alternative name count limit")
         );
         if critical {
             ensure!(
@@ -248,12 +274,12 @@ fn validate_extensions(
                         | GeneralName::IpAddress(_)
                         | GeneralName::DirectoryName(_)
                 )),
-                "unsupported critical subject alternative name form"
+                Error::unsupported("unsupported critical subject alternative name form")
             );
         }
     }
-    let basic = t.get::<BasicConstraints>().map_err(anyhow::Error::msg)?;
-    let usage = t.get::<KeyUsage>().map_err(anyhow::Error::msg)?;
+    let basic = t.get::<BasicConstraints>().map_err(Error::malformed)?;
+    let usage = t.get::<KeyUsage>().map_err(Error::malformed)?;
     if leaf && crl_signer {
         // A CRL signer may be an end entity or a CA; cRLSign is checked by the caller.
     } else if leaf {
@@ -265,30 +291,30 @@ fn validate_extensions(
             );
         }
     } else {
-        let (_, b) = basic.context("issuer lacks basic constraints")?;
+        let (_, b) = basic.ok_or_else(|| Error::policy("issuer lacks basic constraints"))?;
         ensure!(b.ca, "issuer not a CA");
         if let Some(limit) = b.path_len_constraint {
             ensure!(ca_below <= usize::from(limit), "CA path length exceeded");
         }
-        let (_, u) = usage.context("issuer lacks key usage")?;
+        let (_, u) = usage.ok_or_else(|| Error::policy("issuer lacks key usage"))?;
         ensure!(
             u.key_cert_sign(),
             "issuer key usage forbids certificate signing"
         );
     }
-    let eku_ext = t.get::<ExtendedKeyUsage>().map_err(anyhow::Error::msg)?;
+    let eku_ext = t.get::<ExtendedKeyUsage>().map_err(Error::malformed)?;
     if crl_signer {
         // RFC 5280 places no extended key usage requirement on CRL signers.
     } else if leaf {
-        let (_, e) = eku_ext.context("signer lacks required EKU")?;
+        let (_, e) = eku_ext.ok_or_else(|| Error::policy("signer lacks required EKU"))?;
         ensure!(
-            e.0.iter().any(|v| v.to_string() == eku),
-            "signer lacks required EKU {eku}"
+            e.0.contains(&eku),
+            Error::policy(format!("signer lacks required EKU {eku}"))
         );
     } else if let Some((_, e)) = eku_ext {
         ensure!(
             e.0.iter()
-                .any(|v| v.to_string() == eku || v.to_string() == "2.5.29.37.0"),
+                .any(|v| *v == eku || *v == ObjectIdentifier::new_unwrap("2.5.29.37.0")),
             "issuer EKU restricts required usage"
         );
     }
@@ -301,7 +327,7 @@ fn issuer_matches(child: &Certificate, parent: &Certificate) -> Result<bool> {
     if let Some((_, aki)) = child
         .tbs_certificate
         .get::<AuthorityKeyIdentifier>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
     {
         ensure!(
             aki.authority_cert_issuer.is_some() == aki.authority_cert_serial_number.is_some(),
@@ -311,7 +337,7 @@ fn issuer_matches(child: &Certificate, parent: &Certificate) -> Result<bool> {
             let Some((_, ski)) = parent
                 .tbs_certificate
                 .get::<SubjectKeyIdentifier>()
-                .map_err(anyhow::Error::msg)?
+                .map_err(Error::malformed)?
             else {
                 return Ok(false);
             };
@@ -329,36 +355,6 @@ fn issuer_matches(child: &Certificate, parent: &Certificate) -> Result<bool> {
     }
     Ok(true)
 }
-/// Validate a path to an exact caller-pinned DER root. Certificate names never establish trust.
-/// Revocation and timestamp verification are separate policy layers.
-pub fn validate(
-    leaf_der: &[u8],
-    certs: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    unix_time: u64,
-    required_eku: &str,
-) -> Result<ChainReport> {
-    validate_with_policy(leaf_der, certs, roots, unix_time, required_eku, false)
-}
-pub fn validate_with_policy(
-    leaf_der: &[u8],
-    certs: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    unix_time: u64,
-    required_eku: &str,
-    allow_sha1: bool,
-) -> Result<ChainReport> {
-    validate_path(
-        leaf_der,
-        certs,
-        roots,
-        unix_time,
-        required_eku,
-        allow_sha1,
-        false,
-    )
-}
-
 /// Independent limits for store loading and path-search work.
 #[derive(Debug, Clone, Copy)]
 pub struct PathLimits {
@@ -380,104 +376,54 @@ impl Default for PathLimits {
     }
 }
 
-/// Search alternative issuer paths under explicit store and work budgets.
-pub fn validate_with_limits(
-    leaf_der: &[u8],
-    certs: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    unix_time: u64,
-    required_eku: &str,
-    allow_sha1: bool,
-    limits: PathLimits,
-) -> Result<ChainReport> {
-    search_path(
-        leaf_der,
-        certs,
-        roots,
-        unix_time,
-        required_eku,
-        allow_sha1,
-        false,
-        limits,
-        &PathOptions::default(),
-        &mut |_, _| Ok(()),
-    )
+/// Borrowed trust inputs and explicit validation policy for one certificate path.
+#[derive(Debug, Clone)]
+pub struct ChainOptions<'a> {
+    pub roots: CertificateStore<'a>,
+    pub candidates: CertificateStore<'a>,
+    pub evaluation_time: u64,
+    pub required_eku: ObjectIdentifier,
+    pub allow_sha1: bool,
+    pub limits: PathLimits,
+    pub path: PathOptions,
 }
-
-fn validate_path(
-    leaf_der: &[u8],
-    certs: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    unix_time: u64,
-    required_eku: &str,
-    allow_sha1: bool,
-    microsoft_timestamp_compatibility: bool,
-) -> Result<ChainReport> {
-    search_path(
-        leaf_der,
-        certs,
-        roots,
-        unix_time,
-        required_eku,
-        allow_sha1,
-        microsoft_timestamp_compatibility,
-        PathLimits::default(),
-        &PathOptions::default(),
-        &mut |_, _| Ok(()),
-    )
+impl<'a> ChainOptions<'a> {
+    pub fn new(
+        roots: impl Into<CertificateStore<'a>>,
+        evaluation_time: u64,
+        required_eku: ObjectIdentifier,
+    ) -> Self {
+        Self {
+            roots: roots.into(),
+            candidates: CertificateStore::default(),
+            evaluation_time,
+            required_eku,
+            allow_sha1: false,
+            limits: PathLimits::default(),
+            path: PathOptions::default(),
+        }
+    }
 }
-
-/// Evaluate caller policy on each fully validated path before choosing one.
-/// Rejection continues deterministic alternative search under the same work budgets.
-#[allow(clippy::too_many_arguments)]
+/// Validate a path to an exact pinned anchor using the explicit options.
+pub fn validate(leaf_der: &[u8], options: &ChainOptions<'_>) -> Result<ChainReport> {
+    validate_with_path_policy(leaf_der, options, |_| Ok(()))
+}
+/// Evaluate caller policy on each fully validated candidate before choosing one.
 pub fn validate_with_path_policy(
     leaf_der: &[u8],
-    certs: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    unix_time: u64,
-    required_eku: &str,
-    allow_sha1: bool,
-    limits: PathLimits,
+    options: &ChainOptions<'_>,
     mut accept_path: impl FnMut(&ChainReport) -> Result<()>,
 ) -> Result<ChainReport> {
     search_path(
         leaf_der,
-        certs,
-        roots,
-        unix_time,
-        required_eku,
-        allow_sha1,
+        options.candidates,
+        options.roots,
+        options.evaluation_time,
+        options.required_eku,
+        options.allow_sha1,
         false,
-        limits,
-        &PathOptions::default(),
-        &mut |report, _| accept_path(report),
-    )
-}
-
-/// Like `validate_with_path_policy`, with explicit RFC 5280 policy inputs and
-/// optional partial-chain selection.
-#[allow(clippy::too_many_arguments)]
-pub fn validate_with_options(
-    leaf_der: &[u8],
-    certs: &[Vec<u8>],
-    roots: &[Vec<u8>],
-    unix_time: u64,
-    required_eku: &str,
-    allow_sha1: bool,
-    limits: PathLimits,
-    options: &PathOptions,
-    mut accept_path: impl FnMut(&ChainReport) -> Result<()>,
-) -> Result<ChainReport> {
-    search_path(
-        leaf_der,
-        certs,
-        roots,
-        unix_time,
-        required_eku,
-        allow_sha1,
-        false,
-        limits,
-        options,
+        options.limits,
+        &options.path,
         &mut |report, _| accept_path(report),
     )
 }
@@ -501,11 +447,11 @@ fn diagnostic(
     CertificateDiagnostic {
         sha256: hex::encode(Sha256::digest(bytes)),
         role: if position == 0 {
-            "end-entity"
+            CertificateRole::EndEntity
         } else if position + 1 == length {
-            "anchor"
+            CertificateRole::Anchor
         } else {
-            "intermediate"
+            CertificateRole::Intermediate
         },
         self_issued: certificate.tbs_certificate.subject == certificate.tbs_certificate.issuer,
         enforced_extensions: enforced
@@ -526,10 +472,10 @@ fn diagnostic(
 #[allow(clippy::too_many_arguments)]
 fn search_path(
     leaf_der: &[u8],
-    certs: &[Vec<u8>],
-    roots: &[Vec<u8>],
+    certs: CertificateStore<'_>,
+    roots: CertificateStore<'_>,
     unix_time: u64,
-    required_eku: &str,
+    required_eku: ObjectIdentifier,
     allow_sha1: bool,
     microsoft_timestamp_compatibility: bool,
     limits: PathLimits,
@@ -537,40 +483,51 @@ fn search_path(
     accept_path: &mut ParsedPathPolicy<'_>,
 ) -> Result<ChainReport> {
     use alloc::collections::{BTreeMap, BTreeSet};
-    ensure!(!roots.is_empty(), "no trust anchors supplied");
-    ensure!(limits.max_depth > 0, "certificate path depth limit");
+    ensure!(
+        !roots.is_empty(),
+        Error::configuration("no trust anchors supplied")
+    );
+    ensure!(
+        limits.max_depth > 0,
+        Error::resource_limit("certificate path depth limit")
+    );
     // Bound input before parsing, including duplicate input bytes.
     ensure!(
         certs
             .len()
             .checked_add(roots.len())
             .is_some_and(|n| n <= limits.max_store_certificates),
-        "certificate store count limit"
+        Error::resource_limit("certificate store count limit")
     );
     let total = certs
         .iter()
-        .chain(roots)
+        .chain(roots.iter())
         .try_fold(leaf_der.len(), |n, b| n.checked_add(b.len()))
-        .context("certificate store byte overflow")?;
+        .ok_or_else(|| Error::resource_limit("certificate store byte overflow"))?;
     ensure!(
         total <= limits.max_store_bytes,
-        "certificate store byte limit"
+        Error::resource_limit("certificate store byte limit")
     );
-    ensure!(leaf_der.len() <= 256 * 1024, "leaf certificate byte limit");
+    ensure!(
+        leaf_der.len() <= 256 * 1024,
+        Error::resource_limit("leaf certificate byte limit")
+    );
     // DER ordering makes the selected path independent of caller collection order.
-    let anchors: BTreeSet<&[u8]> = roots.iter().map(Vec::as_slice).collect();
+    let anchors: BTreeSet<&[u8]> = roots.iter().collect();
     let unique: alloc::collections::BTreeSet<&[u8]> = certs
         .iter()
-        .chain(roots)
-        .map(Vec::as_slice)
+        .chain(roots.iter())
         .chain(core::iter::once(leaf_der))
         .collect();
     let mut pool = Vec::with_capacity(unique.len());
     let mut subjects: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
     let mut leaf_index = 0;
     for bytes in unique {
-        ensure!(bytes.len() <= 256 * 1024, "certificate byte limit");
-        let certificate = Certificate::from_der(bytes).map_err(anyhow::Error::msg)?;
+        ensure!(
+            bytes.len() <= 256 * 1024,
+            Error::resource_limit("certificate byte limit")
+        );
+        let certificate = Certificate::from_der(bytes).map_err(Error::malformed)?;
         let index = pool.len();
         if bytes == leaf_der {
             leaf_index = index;
@@ -581,7 +538,7 @@ fn search_path(
                     .tbs_certificate
                     .subject
                     .to_der()
-                    .map_err(anyhow::Error::msg)?,
+                    .map_err(Error::malformed)?,
             )
             .or_default()
             .push(index);
@@ -591,7 +548,7 @@ fn search_path(
     let mut pending = vec![(vec![leaf_index], false)];
     let mut explored = 0usize;
     let mut signature_checks = 0usize;
-    let mut last_error = anyhow::anyhow!("certificate issuer missing");
+    let mut last_error = Error::policy("certificate issuer missing");
     let mut rejected: Vec<RejectedPath> = Vec::new();
     macro_rules! reject {
         ($path:expr, $error:expr) => {{
@@ -613,7 +570,7 @@ fn search_path(
         explored += 1;
         ensure!(
             explored <= limits.max_explored_candidates,
-            "certificate explored candidate limit"
+            Error::resource_limit("certificate explored candidate limit")
         );
         let index = *path.last().unwrap();
         let (bytes, current) = &pool[index];
@@ -640,14 +597,14 @@ fn search_path(
             if depth == 0 {
                 reject!(
                     path,
-                    anyhow::anyhow!("pinned root must be a self-issued CA, not the leaf")
+                    Error::policy("pinned root must be a self-issued CA, not the leaf")
                 );
             }
             let self_issued = current.tbs_certificate.issuer == current.tbs_certificate.subject;
             if !self_issued && !options.partial_chain {
                 reject!(
                     path,
-                    anyhow::anyhow!(
+                    Error::policy(
                         "pinned root must be a self-issued CA, not the leaf; \
                          partial chains require explicit selection"
                     )
@@ -657,11 +614,13 @@ fn search_path(
                 signature_checks += 1;
                 ensure!(
                     signature_checks <= limits.max_signature_checks,
-                    "certificate signature-check limit"
+                    Error::resource_limit("certificate signature-check limit")
                 );
-                if let Err(error) =
-                    crypto::verify_certificate_with_policy(current, current, allow_sha1)
-                {
+                if let Err(error) = crypto::verify_certificate(
+                    current,
+                    current,
+                    &crypto::CryptoOptions { allow_sha1 },
+                ) {
                     reject!(path, error);
                 }
             }
@@ -671,7 +630,7 @@ fn search_path(
             {
                 reject!(
                     path,
-                    anyhow::anyhow!(
+                    Error::policy(
                         "Microsoft timestamp compatibility requires an authorized Microsoft root"
                     )
                 );
@@ -690,11 +649,7 @@ fn search_path(
                 microsoft_timestamp_policy_certificate_sha256: interpreted
                     .then(|| MICROSOFT_TIMESTAMP_PCA_2010.to_owned()),
                 chain_der: path.iter().map(|i| pool[*i].0.to_vec()).collect(),
-                valid_policies: outcome
-                    .valid_policies
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
+                valid_policies: outcome.valid_policies,
                 certificates: path
                     .iter()
                     .enumerate()
@@ -712,14 +667,14 @@ fn search_path(
             }
         }
         if path.len() >= limits.max_depth {
-            reject!(path, anyhow::anyhow!("certificate path depth limit"));
+            reject!(path, Error::resource_limit("certificate path depth limit"));
         }
         if let Some(candidates) = subjects.get(
             &current
                 .tbs_certificate
                 .issuer
                 .to_der()
-                .map_err(anyhow::Error::msg)?,
+                .map_err(Error::malformed)?,
         ) {
             for &parent_index in candidates.iter().rev() {
                 if path.contains(&parent_index) {
@@ -732,11 +687,13 @@ fn search_path(
                 signature_checks += 1;
                 ensure!(
                     signature_checks <= limits.max_signature_checks,
-                    "certificate signature-check limit"
+                    Error::resource_limit("certificate signature-check limit")
                 );
-                if let Err(error) =
-                    crypto::verify_certificate_with_policy(current, parent, allow_sha1)
-                {
+                if let Err(error) = crypto::verify_certificate(
+                    current,
+                    parent,
+                    &crypto::CryptoOptions { allow_sha1 },
+                ) {
                     if rejected.len() < MAX_REJECTED_PATHS {
                         let mut candidate = path.clone();
                         candidate.push(parent_index);
@@ -754,7 +711,7 @@ fn search_path(
                 // Bound the queued paths as well as paths already visited.
                 ensure!(
                     explored + pending.len() < limits.max_explored_candidates,
-                    "certificate explored candidate limit"
+                    Error::resource_limit("certificate explored candidate limit")
                 );
                 let mut next = path.clone();
                 next.push(parent_index);
@@ -782,7 +739,7 @@ fn check_descendant_names<'a>(
     if let Some((_, constraints)) = issuer
         .tbs_certificate
         .get::<x509_cert::ext::pkix::NameConstraints>()
-        .map_err(anyhow::Error::msg)?
+        .map_err(Error::malformed)?
     {
         for (index, child) in descendants.enumerate() {
             if index == 0 || !self_issued(child) {
@@ -796,7 +753,7 @@ fn check_descendant_names<'a>(
 fn validate_parsed_constraints(
     certificates: &ParsedPath<'_>,
     unix_time: u64,
-    eku: &str,
+    eku: ObjectIdentifier,
     microsoft_timestamp_compatibility: bool,
 ) -> Result<()> {
     for (depth, (bytes, certificate)) in certificates.iter().enumerate() {
@@ -819,14 +776,14 @@ fn validate_parsed_constraints(
 pub(super) fn validate_report_constraints(
     report: &ChainReport,
     unix_time: u64,
-    eku: &str,
+    eku: ObjectIdentifier,
 ) -> Result<()> {
     let parsed = report
         .chain_der
         .iter()
         .map(|bytes| Certificate::from_der(bytes))
         .collect::<core::result::Result<Vec<_>, _>>()
-        .map_err(anyhow::Error::msg)?;
+        .map_err(Error::malformed)?;
     let borrowed = report
         .chain_der
         .iter()
@@ -847,8 +804,8 @@ pub(super) fn validate_report_constraints(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_timestamp_path(
     leaf_der: &[u8],
-    certs: &[Vec<u8>],
-    roots: &[Vec<u8>],
+    certs: CertificateStore<'_>,
+    roots: CertificateStore<'_>,
     end_time: u64,
     start_time: u64,
     allow_sha1: bool,
@@ -858,14 +815,14 @@ pub(super) fn validate_timestamp_path(
 ) -> Result<ChainReport> {
     ensure!(
         start_time <= end_time,
-        "invalid timestamp accuracy interval"
+        Error::malformed("invalid timestamp accuracy interval")
     );
     search_path(
         leaf_der,
         certs,
         roots,
         end_time,
-        "1.3.6.1.5.5.7.3.8",
+        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8"),
         allow_sha1,
         compatibility,
         limits,
@@ -875,7 +832,7 @@ pub(super) fn validate_timestamp_path(
                 validate_parsed_constraints(
                     parsed,
                     start_time,
-                    "1.3.6.1.5.5.7.3.8",
+                    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8"),
                     compatibility,
                 )?;
             }
@@ -885,12 +842,12 @@ pub(super) fn validate_timestamp_path(
 }
 
 /// Inspect whether a leaf explicitly carries an EKU in addition to the chain's required EKU.
-pub fn has_eku(certificate_der: &[u8], required: &str) -> Result<bool> {
-    let c = Certificate::from_der(certificate_der).map_err(anyhow::Error::msg)?;
+pub fn has_eku(certificate_der: &[u8], required: ObjectIdentifier) -> Result<bool> {
+    let c = Certificate::from_der(certificate_der).map_err(Error::malformed)?;
     Ok(c.tbs_certificate
         .get::<ExtendedKeyUsage>()
-        .map_err(anyhow::Error::msg)?
-        .is_some_and(|(_, e)| e.0.iter().any(|v| v.to_string() == required)))
+        .map_err(Error::malformed)?
+        .is_some_and(|(_, e)| e.0.contains(&required)))
 }
 
 #[cfg(test)]
@@ -914,7 +871,7 @@ mod tests {
             .to_der()
             .unwrap();
         CertificatePolicies(vec![PolicyInformation {
-            policy_identifier: MICROSOFT_TIMESTAMP_POLICY.parse().unwrap(),
+            policy_identifier: MICROSOFT_TIMESTAMP_POLICY,
             policy_qualifiers: Some(vec![
                 PolicyQualifierInfo {
                     policy_qualifier_id: "1.3.6.1.5.5.7.2.1".parse().unwrap(),

@@ -178,9 +178,9 @@ fn independent_openssl_ctl_rejects_untrusted_stale_and_wrong_usage() {
     let cms = fs::read(dir.join("list.cms")).unwrap();
     let anchors = vec![fs::read(dir.join("root.der")).unwrap()];
     let policy = CtlAuthenticationPolicy {
-        bootstrap_anchors: &anchors,
-        issuer_candidates: &[],
-        required_signer_eku: "1.3.6.1.4.1.311.10.3.1",
+        bootstrap_anchors: (&anchors).into(),
+        issuer_candidates: Default::default(),
+        required_signer_eku: "1.3.6.1.4.1.311.10.3.1".parse().unwrap(),
         required_list_usage: usage,
         verification_time: now,
         minimum_sequence: Some(&[7]),
@@ -216,7 +216,7 @@ fn independent_openssl_ctl_rejects_untrusted_stale_and_wrong_usage() {
         authenticate(
             &cms,
             &CtlAuthenticationPolicy {
-                bootstrap_anchors: &foreign,
+                bootstrap_anchors: (&foreign).into(),
                 ..policy
             },
             Default::default()

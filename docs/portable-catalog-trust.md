@@ -135,7 +135,7 @@ servicing correctness; see [external baseline selection](https://github.com/Cadd
 
 ## Rust API migration
 
-The unreleased Rust API uses a single immutable `portable::Verifier` in place of
+The 0.2.0 Rust API uses a single immutable `portable::Verifier` in place of
 `PortableVerifier` and `ValidatedVerifier`. Use `Verifier::load`,
 `Verifier::from_policy`, or `Verifier::builder`. The injectable reader in
 `from_policy_with_reader` and `VerifierBuilder::build_with_reader` enforces the
@@ -150,7 +150,7 @@ use wintrust::{WinVerifyTrust, portable::{PortableLimits, Verifier, sip::SipKind
 let verifier = Verifier::load(Path::new("trust.json"), PortableLimits::default())?;
 let report = WinVerifyTrust(&verifier, Path::new("update.cat"), Path::new("component.mum"), SipKind::FlatXml)?;
 assert_eq!(report.verification_time, verifier.evaluation_time());
-# Ok::<(), anyhow::Error>(())
+# Ok::<(), wintrust::Error>(())
 ```
 
 Timestamp functions take `timestamp::TimestampOptions` rather than positional
@@ -165,13 +165,13 @@ use wintrust::portable::{chain, timestamp::{self, TimestampOptions}};
 # let token: Vec<u8> = vec![];
 # let signature: Vec<u8> = vec![];
 let options = TimestampOptions {
-    issuer_candidates: &intermediates,
+    issuer_candidates: (&intermediates).into(),
     path_limits: chain::PathLimits::default(),
-    ..TimestampOptions::new(&roots, 1_791_117_219)
+    ..TimestampOptions::new((&roots).into(), 1_791_117_219)
 };
 let stamp = timestamp::verify_rfc3161(&token, &signature, &options)?;
 # let _ = stamp;
-# Ok::<(), anyhow::Error>(())
+# Ok::<(), wintrust::Error>(())
 ```
 
 `verify_rfc3161`, `verify_legacy`, `verify_timestamps`, and
@@ -201,9 +201,52 @@ allocator, set `PortablePolicy::verification_time`, and call
 `Verifier::from_artifact_reader(policy, limits, reader)`. The reader receives
 `&ArtifactRef` and a byte limit; it returns owned bytes. The verifier enforces
 pins, individual and aggregate budgets, DER validity and all trust policy checks.
-`ArtifactRef::path` is an opaque `String` without `std` and a `PathBuf` with it;
-its JSON representation is unchanged.
+`ArtifactRef::path` is an opaque `String` in every feature configuration.
+Filesystem adapters convert it to a path; its JSON representation is unchanged.
 
 The pinned upstream Unicode string preparation code is preserved as a private
 `alloc`-compatible module, with its licenses, so name-constraint normalization
 remains the same in both builds.
+
+### Typed verification errors and borrowed inputs
+
+Verification APIs return `wintrust::Result<T>` with a non-exhaustive
+`wintrust::Error` enum. Match `MalformedInput`, `UnsupportedAlgorithm`,
+`PolicyRejected`, `ResourceLimit`, `InvalidConfiguration`, `InvalidSignature`,
+or `Io` to handle failures without parsing diagnostic strings. Context preserves
+the category. Inspection APIs retain `CatalogError`; trust verification converts
+it into the corresponding verification category.
+
+`CertificateStore` is a borrowed view over `&[Vec<u8>]` or `&[&[u8]]`; it copies no
+DER bytes. Use `CertificateStore::from_slices` for static or externally owned
+buffers, or `.into()` for an existing owned collection. Trust anchors remain
+explicit and separate from issuer candidates.
+
+Chain validation now takes `chain::ChainOptions`: `chain::validate(leaf, &options)`
+or `chain::validate_with_path_policy(leaf, &options, callback)`. Policy-processing
+inputs remain in `options.path`, and budgets in `options.limits`. Revocation uses
+`RevocationOptions` with borrowed evidence, signing time, evaluation time, and
+limits; online acquisition takes `AcquisitionOptions`. Cryptographic operations
+use `CryptoOptions` and `SignatureOptions`; CMS verification uses
+`SignedDataOptions` for content type, embedded/detached content, and cryptographic
+policy. These replace positional `_with_*` forwarding variants.
+
+OID fields and arguments use the re-exported `ObjectIdentifier`; construct one
+with `.parse()` for caller input or `ObjectIdentifier::new_unwrap` for a checked
+constant. Timestamp formats, certificate roles, and artifact kind, origin and
+source are enums. Their serialized values remain the previous strings.
+
+```rust,no_run
+use wintrust::{CertificateStore, ObjectIdentifier, portable::chain::{self, ChainOptions}};
+# let root_der: &[u8] = &[];
+# let leaf_der: &[u8] = &[];
+let roots = [root_der];
+let options = ChainOptions::new(
+    CertificateStore::from_slices(&roots),
+    1_791_117_219,
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3"),
+);
+let report = chain::validate(leaf_der, &options)?;
+# let _ = report;
+# Ok::<(), wintrust::Error>(())
+```

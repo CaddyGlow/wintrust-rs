@@ -211,16 +211,10 @@ fn evaluate(pki: &Pki, crls: &[Vec<u8>], signers: &[Certificate]) -> revocation:
         .iter()
         .map(|c| c.to_der().unwrap())
         .collect::<Vec<_>>();
-    let report = revocation::verify_chain_revocation_with_signers(
-        &path,
-        crls,
-        &[],
-        &signers,
-        TIME,
-        TIME,
-        RevocationLimits::default(),
-    )
-    .unwrap();
+    let mut options = revocation::RevocationOptions::new(TIME, TIME);
+    options.crls = crls.into();
+    options.crl_signers = (&signers).into();
+    let report = revocation::verify_chain_revocation((&path).into(), &options).unwrap();
     report.certificates.into_iter().next().unwrap()
 }
 fn status(pki: &Pki, crls: &[Vec<u8>]) -> RevocationStatus {
@@ -993,11 +987,22 @@ fn pinned_evidence_provenance_records_kind_location_and_digest() {
     )
     .unwrap();
     let kinds = provenance.iter().map(|a| a.kind).collect::<Vec<_>>();
-    assert_eq!(kinds, ["crl", "delta-crl", "ocsp"]);
-    assert!(provenance.iter().all(|a| a.origin == "pinned-file"
-        && a.source == "policy"
-        && a.retrieved_at.is_none()
-        && a.certificate_sha256.is_none()));
+    assert_eq!(
+        kinds,
+        [
+            revocation::ArtifactKind::Crl,
+            revocation::ArtifactKind::DeltaCrl,
+            revocation::ArtifactKind::Ocsp
+        ]
+    );
+    assert!(
+        provenance
+            .iter()
+            .all(|a| a.origin == revocation::ArtifactOrigin::PinnedFile
+                && a.source == revocation::ArtifactSource::Policy
+                && a.retrieved_at.is_none()
+                && a.certificate_sha256.is_none())
+    );
     assert_eq!(provenance[0].location, "evidence/base.crl");
     assert_eq!(provenance[0].bytes, base.len());
     use sha2::Digest;
@@ -1029,4 +1034,45 @@ fn stale_or_future_delta_cannot_release_certificate_hold() {
             RevocationStatus::Revoked
         );
     }
+}
+
+#[test]
+fn revocation_options_accept_owned_and_borrowed_artifact_stores() {
+    let p = pki(None);
+    let path = [p.leaf.to_der().unwrap(), p.root.to_der().unwrap()];
+    let crls = [crl(&p).der()];
+    let mut options = revocation::RevocationOptions::new(TIME, TIME);
+    options.crls = (&crls).into();
+    let owned = revocation::verify_chain_revocation((&path).into(), &options).unwrap();
+    let path_refs = path.each_ref().map(Vec::as_slice);
+    let crl_refs = crls.each_ref().map(Vec::as_slice);
+    options.crls = (&crl_refs).into();
+    let borrowed = revocation::verify_chain_revocation((&path_refs).into(), &options).unwrap();
+    assert_eq!(
+        serde_json::to_value(owned).unwrap(),
+        serde_json::to_value(borrowed).unwrap()
+    );
+}
+
+#[test]
+fn revocation_failures_preserve_input_and_resource_error_categories() {
+    use wintrust::error::Error;
+    let p = pki(None);
+    let path = [p.leaf.to_der().unwrap(), p.root.to_der().unwrap()];
+    let crls = [crl(&p).der()];
+    let mut options = revocation::RevocationOptions::new(TIME, TIME);
+    options.crls = (&crls).into();
+    options.limits.max_artifacts = 0;
+    assert!(matches!(
+        revocation::verify_chain_revocation((&path).into(), &options),
+        Err(Error::ResourceLimit(_))
+    ));
+    let malformed = [vec![0x30, 0x00]];
+    assert!(matches!(
+        revocation::verify_chain_revocation(
+            (&malformed).into(),
+            &revocation::RevocationOptions::new(TIME, TIME)
+        ),
+        Err(Error::MalformedInput(_))
+    ));
 }
